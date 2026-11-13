@@ -1,0 +1,65 @@
+"""Finding robots and opening them.
+
+A robot is named by a short spec string:
+    sim                          the built-in simulated rover + arm
+    ros2                         whatever ROS 2 robot is on this machine's ROS graph
+    serial:/dev/ttyUSB0@115200   a microcontroller speaking the Eddy line protocol
+    tcp:192.168.1.20:9000        the same protocol over the network
+    auto                         the first real robot found, else the simulator
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+from typing import List, Tuple
+
+from .base import Adapter
+
+
+def open_robot(spec: str = "auto") -> Adapter:
+    spec = (spec or "auto").strip()
+    if spec == "auto":
+        found = [s for s, _ in scan() if s != "sim"]
+        spec = found[0] if found else "sim"
+    if spec == "sim" or spec.startswith("sim:"):
+        from .sim import SimAdapter
+        return SimAdapter(name=spec.partition(":")[2] or "sim-rover")
+    if spec == "ros2" or spec.startswith("ros2:"):
+        from .ros2 import Ros2Adapter
+        return Ros2Adapter(cmd_vel=spec.partition(":")[2] or None)
+    if spec.startswith(("serial:", "tcp:")):
+        from .line import LineAdapter
+        return LineAdapter(spec)
+    raise ValueError(f"don't know how to open robot '{spec}' (try: sim, ros2, serial:<port>, tcp:<host>:<port>)")
+
+
+def ros2_available() -> bool:
+    return bool(os.environ.get("ROS_DISTRO")) and importlib.util.find_spec("rclpy") is not None
+
+
+def scan(probe_serial: bool = True) -> List[Tuple[str, str]]:
+    """List robots Eddy could attach to from this machine: (spec, description)."""
+    found: List[Tuple[str, str]] = []
+    if ros2_available():
+        found.append(("ros2", f"ROS 2 {os.environ.get('ROS_DISTRO')} graph on this machine"))
+    if importlib.util.find_spec("serial") is not None:
+        from serial.tools import list_ports
+        from .line import LineAdapter
+        for port in list_ports.comports():
+            if "bluetooth" in port.device.lower():
+                continue
+            spec, note = f"serial:{port.device}", port.description or "serial device"
+            if probe_serial:
+                adapter = LineAdapter(spec, timeout=2.5)
+                try:
+                    note = f"{adapter.connect().name} (answers Eddy protocol)"
+                except Exception:
+                    note += " (did not answer the Eddy handshake)"
+                finally:
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
+            found.append((spec, note))
+    found.append(("sim", "built-in simulated rover with a 4-joint arm"))
+    return found
