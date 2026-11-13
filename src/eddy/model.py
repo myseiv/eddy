@@ -10,17 +10,21 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
+# ---- Description of a robot -----------------------------------------------------
+
 @dataclass
 class JointSpec:
+    """One joint the robot lets us command, with the limits Eddy must respect."""
     name: str
-    lower: float = -3.14159
-    upper: float = 3.14159
-    kind: str = "revolute"
-    max_velocity: float = 1.5
+    lower: float = -3.14159          # lowest allowed position (radians, or metres if prismatic)
+    upper: float = 3.14159           # highest allowed position
+    kind: str = "revolute"           # revolute (turns), continuous (turns forever) or prismatic (slides)
+    max_velocity: float = 1.5        # rad/s (or m/s)
 
 
 @dataclass
 class DriveSpec:
+    """How the robot's base drives, and how fast Eddy is allowed to push it."""
     kind: str = "differential"
     max_linear: float = 0.5   # m/s
     max_angular: float = 1.5  # rad/s
@@ -28,6 +32,11 @@ class DriveSpec:
 
 @dataclass
 class RobotModel:
+    """Everything an adapter found out about the robot it connected to.
+
+    Fields left empty (drive=None, no joints, chain=None, gripper=False) mean the robot does
+    not have that ability, and Eddy will refuse commands that need it.
+    """
     name: str
     kind: str = "unknown"                      # which adapter produced it
     drive: Optional[DriveSpec] = None
@@ -38,11 +47,13 @@ class RobotModel:
     details: Dict[str, object] = field(default_factory=dict)  # adapter-specific notes (topics, ports)
 
     def capabilities(self) -> List[str]:
+        """List what this robot can do, as short words ("drive", "reach", "range", ...)."""
         caps = []
         if self.drive:
             caps.append("drive")
         if self.joints:
             caps.append("joints")
+        # "reach" (move the tool to a point) needs the arm's geometry, not just its joints.
         if self.chain is not None:
             caps.append("reach")
         if self.gripper:
@@ -50,12 +61,14 @@ class RobotModel:
         return caps + list(self.sensors)
 
     def joint(self, name: str) -> Optional[JointSpec]:
+        """Look up a joint by name; None if the robot has no such joint."""
         for j in self.joints:
             if j.name == name:
                 return j
         return None
 
     def summary(self) -> str:
+        """A multi-line, human-readable description (what `eddy info` prints)."""
         lines = [f"robot: {self.name}  (via {self.kind})",
                  f"can:   {', '.join(self.capabilities()) or 'nothing detected'}"]
         if self.drive:
@@ -70,22 +83,25 @@ class RobotModel:
 
 @dataclass
 class RobotState:
-    x: float = 0.0
+    """A snapshot of where the robot is right now, as reported by its adapter."""
+    x: float = 0.0                             # metres, in the odometry frame
     y: float = 0.0
     heading: float = 0.0                       # radians, counter-clockwise from +x
-    joints: Dict[str, float] = field(default_factory=dict)
+    joints: Dict[str, float] = field(default_factory=dict)   # joint name -> current position
     range_ahead: Optional[float] = None        # metres to the nearest thing in front
     gripper: Optional[float] = None            # 0 closed .. 1 open
-    has_odometry: bool = False
+    has_odometry: bool = False                 # False means x, y, heading cannot be trusted
 
 
 # ---- Commands -----------------------------------------------------------------
+# These are the only things Eddy's brain accepts. Every input (text, speech, hand
+# signs, another robot) is turned into one of these before anything moves.
 
 @dataclass
 class Drive:
     """Drive at a speed. Give one of distance (m), angle (rad) or duration (s)."""
-    linear: float = 0.0
-    angular: float = 0.0
+    linear: float = 0.0                # m/s, negative is backwards
+    angular: float = 0.0               # rad/s, positive is counter-clockwise (left)
     distance: Optional[float] = None
     angle: Optional[float] = None
     duration: Optional[float] = None
@@ -93,6 +109,7 @@ class Drive:
 
 @dataclass
 class Stop:
+    """Stop all motion now. Always obeyed, and interrupts whatever is running."""
     pass
 
 
@@ -106,21 +123,25 @@ class MoveTo:
 
 @dataclass
 class SetJoints:
+    """Move named joints straight to the given positions (no inverse kinematics)."""
     positions: Dict[str, float]
 
 
 @dataclass
 class Home:
+    """Send every arm joint to zero."""
     pass
 
 
 @dataclass
 class Gripper:
+    """Open or close the gripper."""
     opening: float  # 0 closed .. 1 open
 
 
 @dataclass
 class Say:
+    """Speak a piece of text out loud."""
     text: str
 
 
@@ -132,8 +153,11 @@ class Report:
 
 @dataclass
 class Wander:
+    """Drive around on its own for `duration` seconds, turning away from obstacles."""
     duration: float = 10.0
 
+
+# ---- Reasons a command is not carried out -----------------------------------------
 
 class Unsupported(Exception):
     """The robot does not have the ability a command needs."""

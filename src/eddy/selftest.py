@@ -19,15 +19,18 @@ from .senses.speak import Speaker
 
 
 def run(verbose: bool = True) -> int:
+    """Run every check. Returns 0 if all passed, 1 otherwise (used as the exit code)."""
     failures = []
 
     def check(label: str, ok: bool, detail: str = "") -> None:
+        """Record one result and print it as a PASS or FAIL line."""
         if not ok:
             failures.append(label)
         if verbose:
             print(f"  [{'PASS' if ok else 'FAIL'}] {label}" + (f"  ({detail})" if detail else ""), flush=True)
 
     def fresh():
+        """A new simulated robot in the middle of its room, with a silent Eddy attached."""
         sim = SimAdapter()
         eddy = Eddy(sim, Speaker("silent"))
         eddy.start()
@@ -46,10 +49,12 @@ def run(verbose: bool = True) -> int:
     check("drive forward 1 meter", r.ok and abs(sim.x - 1.0) < 0.03 and abs(sim.y) < 0.01, f"x={sim.x:.3f}")
     r = eddy.tell("turn left 90 degrees")
     check("turn left 90 degrees", r.ok and abs(math.degrees(sim.heading) - 90) < 3, f"heading={math.degrees(sim.heading):.1f}")
+    # The rover now faces +y, so backing up moves it to negative y.
     r = eddy.tell("go back 50 cm")
     check("go back 50 cm", r.ok and abs(sim.y + 0.5) < 0.03, f"y={sim.y:.3f}")
 
     # -- safety: obstacle ahead
+    # The wall is 2 m away; asked for 5 m, Eddy must stop short of it by itself.
     r = eddy.tell("drive forward 5 meters")
     gap = sim.state().range_ahead
     check("stops for an obstacle instead of hitting it", (not sim.bumped) and 0.15 < gap < 0.30 and "in the way" in r.message,
@@ -61,6 +66,7 @@ def run(verbose: bool = True) -> int:
     sim, eddy = fresh()
     target = (0.20, 0.10, 0.30)
     r = eddy.tell("reach 0.2 0.1 0.3")
+    # Measure where the tool really ended up, from the simulated joint angles.
     tool = sim.chain.position([sim.joints[n] for n in sim.chain.joint_names])
     err = math.dist(tool, target)
     check("arm reaches a point (inverse kinematics)", r.ok and err < 0.005, f"tool is {err * 1000:.1f} mm from target")
@@ -74,6 +80,7 @@ def run(verbose: bool = True) -> int:
     check("gripper closes and opens", closed == 0.0 and sim.gripper == 1.0)
 
     # -- hand signs
+    # Each call to sign() is one camera frame. A sign acts on the fifth frame in a row.
     sim, eddy = fresh()
     acted = [eddy.sign(gestures.fake_hand(["index"])) for _ in range(5)]
     check("hand sign 'point' drives forward", acted[-1] is not None and acted[-1].ok and sim.x > 0.08,
@@ -87,6 +94,7 @@ def run(verbose: bool = True) -> int:
     check("hand sign 'thumb right' turns right", sim.heading < before - 0.2)
 
     # -- stop wins over a running command
+    # Real-time simulator, with the drive running in another thread, so "stop" arrives mid-drive.
     sim = SimAdapter(realtime=True)
     eddy = Eddy(sim, Speaker("silent"))
     eddy.start()
@@ -123,6 +131,7 @@ def run(verbose: bool = True) -> int:
     check("drive command on a robot without wheels is declined", not eddy.tell("drive forward 1 meter").ok)
 
     # -- a robot reached over the network with the line protocol
+    # One simulated robot is served on a local port; a second Eddy drives it through that port.
     remote = SimAdapter(name="remote-rover").go_live()
     server = LineServer(remote, host="127.0.0.1").start()
     try:
@@ -141,6 +150,7 @@ def run(verbose: bool = True) -> int:
         server.stop()
 
     # -- two robots talking to each other
+    # (The checks themselves live in link.py, next to the code they test.)
     try:
         from .link import selftest as link_selftest
     except ImportError:

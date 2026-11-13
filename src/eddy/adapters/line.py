@@ -29,13 +29,16 @@ from .base import Adapter
 
 
 class _SocketTransport:
+    """Makes a TCP socket look like a serial port (write / readline / close), so LineAdapter
+    can use either without caring which it has."""
+
     def __init__(self, host: str, port: int, timeout: float):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.file = self.sock.makefile("rwb")
 
     def write(self, data: bytes) -> None:
         self.file.write(data)
-        self.file.flush()
+        self.file.flush()       # send now rather than waiting for the buffer to fill
 
     def readline(self) -> bytes:
         return self.file.readline()
@@ -52,13 +55,15 @@ class LineAdapter(Adapter):
     kind = "line"
 
     def __init__(self, target: str, timeout: float = 2.0, transport=None):
+        """transport: an already open connection to use instead of opening one (for tests)."""
         self.target = target
         self.timeout = timeout
         self.io = transport
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()        # one request and its reply at a time
         self.model: Optional[RobotModel] = None
 
     def _open(self):
+        """Open the connection named by the target string."""
         scheme, _, rest = self.target.partition(":")
         if scheme == "tcp":
             host, _, port = rest.rpartition(":")
@@ -68,18 +73,21 @@ class LineAdapter(Adapter):
                 import serial  # pyserial
             except ImportError as exc:
                 raise RuntimeError("serial robots need pyserial: pip install 'eddy-ai[serial]'") from exc
+            # "port@baud"; 115200 if no baud rate is given.
             port, _, baud = rest.partition("@")
             dev = serial.Serial(port, int(baud or 115200), timeout=self.timeout)
-            dev.reset_input_buffer()
+            dev.reset_input_buffer()        # throw away boot messages the board may have printed
             return dev
         raise ValueError(f"unknown line target '{self.target}'")
 
     def _ask(self, line: str) -> str:
+        """Send one line and return the device's one-line answer."""
         with self.lock:
             self.io.write((line + "\n").encode())
             reply = self.io.readline().decode(errors="replace").strip()
         if not reply:
             raise TimeoutError(f"no answer from {self.target} to '{line.split()[0]}'")
+        # "ERR unsupported ..." means the robot lacks the ability; any other ERR is a failure.
         if reply.startswith("ERR"):
             if "unsupported" in reply:
                 raise Unsupported(reply[3:].strip())
@@ -87,6 +95,7 @@ class LineAdapter(Adapter):
         return reply
 
     def connect(self) -> RobotModel:
+        """Do the handshake: ask the device what it is and build its model from the answer."""
         if self.io is None:
             self.io = self._open()
         hello = json.loads(self._ask("EDDY?"))
@@ -102,12 +111,14 @@ class LineAdapter(Adapter):
             gripper=bool(hello.get("gripper")), sensors=list(hello.get("sensors", [])),
             details={"link": self.target},
         )
+        # A device may include its arm's URDF, which gives Eddy the geometry it needs to reach points.
         if hello.get("urdf"):
             from ..kinematics import Chain
             self.model.chain = Chain.from_urdf(hello["urdf"])
         return self.model
 
     def close(self) -> None:
+        """Stop the robot (best effort) and close the connection."""
         if self.io is not None:
             try:
                 self.stop()
@@ -115,6 +126,8 @@ class LineAdapter(Adapter):
                 pass
             self.io.close()
             self.io = None
+
+    # Each command below is one line of the protocol shown at the top of this file.
 
     def set_velocity(self, linear: float, angular: float) -> None:
         self._ask(f"V {linear:.4f} {angular:.4f}")
@@ -130,6 +143,7 @@ class LineAdapter(Adapter):
         self._ask("S")
 
     def state(self) -> RobotState:
+        """Ask the device where it is. Fields the device leaves out fall back to zero or None."""
         s = json.loads(self._ask("?"))
         return RobotState(s.get("x", 0.0), s.get("y", 0.0), s.get("th", 0.0), s.get("joints", {}),
                           s.get("range"), s.get("gripper"),
@@ -140,13 +154,17 @@ class LineServer:
     """Serve an adapter over TCP with the line protocol. One robot, many clients."""
 
     def __init__(self, adapter: Adapter, host: str = "0.0.0.0", port: int = 0, urdf: Optional[str] = None):
+        """Connect the adapter and prepare the server. port=0 lets the system pick a free port."""
         self.adapter = adapter
         self.model = adapter.connect()
+        # Pass the arm geometry on to clients, so they can do inverse kinematics too.
         self.urdf = urdf or (self.model.chain.to_urdf() if self.model.chain is not None else None)
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()        # one command reaches the robot at a time
         outer = self
 
         class Handler(socketserver.StreamRequestHandler):
+            """One client connection: answer every line it sends until it disconnects."""
+
             def handle(self):
                 for raw in self.rfile:
                     reply = outer.handle(raw.decode(errors="replace").strip())
@@ -154,6 +172,7 @@ class LineServer:
                     self.wfile.flush()
 
         class Server(socketserver.ThreadingTCPServer):
+            """TCP server with a thread per client."""
             allow_reuse_address = True
             daemon_threads = True
 
@@ -162,21 +181,25 @@ class LineServer:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self) -> "LineServer":
+        """Begin accepting clients in a background thread."""
         self.thread.start()
         return self
 
     def stop(self) -> None:
+        """Stop serving and release the robot."""
         self.server.shutdown()
         self.server.server_close()
         self.adapter.close()
 
     def handle(self, line: str) -> str:
+        """Carry out one protocol line on the wrapped adapter and return the answer line."""
         if not line:
             return "ERR empty"
-        op, _, rest = line.partition(" ")
+        op, _, rest = line.partition(" ")       # the command letter, then its arguments
         try:
             with self.lock:
                 if op == "EDDY?":
+                    # Handshake: describe the robot as JSON.
                     m = self.model
                     hello = {"eddy": 1, "name": m.name, "gripper": m.gripper, "sensors": m.sensors,
                              "joints": [{"name": j.name, "lower": j.lower, "upper": j.upper, "kind": j.kind}
@@ -191,6 +214,7 @@ class LineServer:
                     lin, ang = (float(v) for v in rest.split())
                     self.adapter.set_velocity(lin, ang)
                 elif op == "J":
+                    # "name=value" tokens are joint targets; a "T<seconds>" token is the duration.
                     positions, duration = {}, 1.0
                     for token in rest.split():
                         if token.startswith("T") and "=" not in token:

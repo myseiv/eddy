@@ -11,6 +11,7 @@ from typing import Optional
 
 from .model import Drive, Gripper, Home, MoveTo, Report, Say, Stop, Wander
 
+# Number words and the value each stands for, so "two meters" works as well as "2 meters".
 _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
           "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twenty": 20, "thirty": 30, "forty": 40,
           "forty-five": 45, "fifty": 50, "sixty": 60, "ninety": 90, "half": 0.5, "quarter": 0.25,
@@ -28,7 +29,10 @@ VOCABULARY = (
     "meter meters centimeter centimeters foot feet inch inches second seconds minute minutes degree degrees "
     "for please"
 )
+# Regex matching one number: digits ("1.5", "-2") or a number word. Longest words first, so
+# "forty-five" is not cut short at "forty".
 _NUM = r"(-?\d+(?:\.\d+)?|" + "|".join(sorted(_WORDS, key=len, reverse=True)) + r")"
+# Units and how many metres (or seconds) one of each is.
 _LENGTH = {"m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0,
            "cm": 0.01, "centimeter": 0.01, "centimeters": 0.01, "centimetre": 0.01, "centimetres": 0.01,
            "mm": 0.001, "foot": 0.3048, "feet": 0.3048, "ft": 0.3048, "inch": 0.0254, "inches": 0.0254}
@@ -36,16 +40,23 @@ _TIME = {"s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0, "minu
 
 
 def _num(token: str) -> float:
+    """Turn a number token ("2", "0.5", "two") into a float."""
     return float(_WORDS[token]) if token in _WORDS else float(token)
 
 
 def _amount(text: str, units: dict) -> Optional[float]:
+    """Find "<number> <unit>" in the text and return it in base units (metres or seconds)."""
     m = re.search(_NUM + r"\s*(" + "|".join(sorted(units, key=len, reverse=True)) + r")\b", text)
     return _num(m.group(1)) * units[m.group(2)] if m else None
 
 
 def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
-    """Return a command, or None if the sentence is not a command Eddy knows."""
+    """Return a command, or None if the sentence is not a command Eddy knows.
+
+    speed and turn_speed are the normal driving speeds (m/s and rad/s) that "slowly" and
+    "fast" scale. The checks below run in priority order: the first rule that matches wins.
+    """
+    # Clean up: lower case, drop punctuation, drop filler words, collapse spaces.
     raw = text.strip()
     t = re.sub(r"[^\w\s.\-,]", " ", raw.lower())
     t = re.sub(r"\b(please|eddy|hey|robot|now|can you|could you)\b", " ", t)
@@ -53,16 +64,20 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     if not t:
         return None
 
+    # "say ..." comes first so the words after it are never read as a command.
+    # The text to speak is taken from the original sentence, keeping its capitals.
     m = re.match(r"(?:say|speak|tell me)\s+(.+)", t)
     if m:
         return Say(raw[re.search(r"(?i)say|speak|tell me", raw).end():].strip(" :,"))
 
+    # Stop is checked before any motion, so "stop driving forward" stops.
     if re.search(r"\b(stop|halt|freeze|whoa|brake|abort|don't move|do not move|stay)\b", t):
         return Stop()
 
     if re.search(r"\b(status|where are you|what are you|who are you|report|what can you do)\b", t):
         return Report()
 
+    # Gripper: "open the gripper", "let go", "grab", ...
     if re.search(r"\b(open)\b.*\b(gripper|hand|claw)\b|\b(release|let go|drop)\b", t):
         return Gripper(1.0)
     if re.search(r"\b(close)\b.*\b(gripper|hand|claw)\b|\b(grab|grasp|grip|pinch)\b", t):
@@ -75,6 +90,7 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     if re.search(r"\b(reach|arm|point at|tool|hand to)\b", t):
         nums = re.findall(r"-?\d+(?:\.\d+)?", t)
         if len(nums) >= 3:
+            # The three numbers are metres unless the sentence says cm or mm.
             scale = 0.01 if re.search(r"\bcm\b|centimet", t) else (0.001 if re.search(r"\bmm\b", t) else 1.0)
             x, y, z = (float(v) * scale for v in nums[:3])
             return MoveTo(x, y, z)
@@ -83,6 +99,7 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     if re.search(r"\b(wander|explore|roam|look around|patrol)\b", t):
         return Wander(_amount(t, _TIME) or 10.0)
 
+    # Driving. "slowly" halves the speed, "fast" raises it by 75%.
     slow = 0.5 if re.search(r"\b(slow|slowly|careful|carefully)\b", t) else 1.0
     fast = 1.75 if re.search(r"\b(fast|quick|quickly)\b", t) else 1.0
     v, w = speed * slow * fast, turn_speed * slow * fast
@@ -90,8 +107,10 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     turn = re.search(r"\b(turn|rotate|spin|face|left|right|around)\b", t)
     straight = re.search(r"\b(forward|forwards|ahead|straight|back|backward|backwards|reverse)\b", t)
     if turn and not straight:
+        # "turn around" with no angle given means 180 degrees.
         if re.search(r"\b(around|about)\b", t) and not re.search(_NUM + r"\s*(deg|degree|degrees)\b", t):
             return Drive(angular=w, angle=math.pi)
+        # Positive angular speed is left (counter-clockwise); right and clockwise are negative.
         direction = -1.0 if re.search(r"\b(right|clockwise)\b", t) and not re.search(r"counter|anti", t) else 1.0
         deg = re.search(_NUM + r"\s*(deg|degree|degrees)\b", t)
         duration = _amount(t, _TIME)
@@ -100,9 +119,9 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
         if duration:
             return Drive(angular=direction * w, duration=duration)
         if re.search(r"\b(left|right|clockwise)\b", t):
-            return Drive(angular=direction * w, angle=math.pi / 2)
+            return Drive(angular=direction * w, angle=math.pi / 2)     # "turn left": a quarter turn
         if re.search(r"\bspin\b", t):
-            return Drive(angular=w, angle=2 * math.pi)
+            return Drive(angular=w, angle=2 * math.pi)                 # "spin": one full turn
         return None
 
     if straight or re.search(r"\b(go|drive|move|come|advance|roll)\b", t):
@@ -114,4 +133,5 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             return Drive(linear=direction * v, duration=duration)
         if straight:
             return Drive(linear=direction * v, distance=0.5)   # "go forward" with no amount: half a metre
+    # "go" or "move" with no direction and no amount is too vague to act on.
     return None

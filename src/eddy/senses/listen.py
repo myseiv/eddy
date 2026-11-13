@@ -13,6 +13,8 @@ from typing import Iterator, Optional
 
 
 def default_model_path() -> Optional[str]:
+    """Find the speech model: the environment variable first, then where the installer puts
+    it, then a folder next to the code. None if there is no model anywhere."""
     for path in (os.environ.get("EDDY_VOSK_MODEL"), os.path.expanduser("~/.eddy/vosk-model"), "models/vosk-model"):
         if path and os.path.isdir(path):
             return path
@@ -20,10 +22,13 @@ def default_model_path() -> Optional[str]:
 
 
 class Listener:
+    """Turns speech into text, from the microphone (phrases) or from a WAV file (transcribe)."""
+
     def __init__(self, model_path: Optional[str] = None, samplerate: int = 16000, device=None,
                  vocabulary: Optional[str] = None):
         """vocabulary: space-separated words to listen for. Default: Eddy's command words.
         Pass "" for open dictation."""
+        # Vosk is imported here, not at the top, so Eddy runs without it until listening is used.
         try:
             import vosk
         except ImportError as exc:
@@ -32,7 +37,7 @@ class Listener:
         if not model_path:
             raise RuntimeError("no Vosk speech model found. Download one from "
                                "https://alphacephei.com/vosk/models and pass --voice-model <folder>")
-        vosk.SetLogLevel(-1)
+        vosk.SetLogLevel(-1)        # silence Vosk's own start-up chatter
         self._vosk = vosk
         self.samplerate = samplerate
         self.device = device
@@ -40,9 +45,12 @@ class Listener:
         if vocabulary is None:
             from ..intents import VOCABULARY
             vocabulary = VOCABULARY
+        # The grammar limits the recogniser to our words; "[unk]" lets it mark anything else
+        # as unknown instead of forcing it onto the nearest command word.
         self.grammar = json.dumps([vocabulary, "[unk]"]) if vocabulary else None
 
     def _recognizer(self, rate: int):
+        """A fresh recogniser for audio at this sample rate, with the grammar if there is one."""
         if self.grammar:
             return self._vosk.KaldiRecognizer(self.model, rate, self.grammar)
         return self._vosk.KaldiRecognizer(self.model, rate)
@@ -55,10 +63,13 @@ class Listener:
             raise RuntimeError("the microphone needs: pip install 'eddy-ai[voice]' and "
                                "sudo apt install libportaudio2") from exc
         recognizer = self._recognizer(self.samplerate)
+        # The sound card calls the callback from its own thread with each half second of audio;
+        # the queue hands those chunks to this thread.
         audio: "queue.Queue[bytes]" = queue.Queue()
         with sounddevice.RawInputStream(samplerate=self.samplerate, blocksize=8000, dtype="int16", channels=1,
                                         device=self.device, callback=lambda data, *_: audio.put(bytes(data))):
             while True:
+                # AcceptWaveform returns True when the speaker has paused, i.e. a phrase is finished.
                 if recognizer.AcceptWaveform(audio.get()):
                     text = _clean(json.loads(recognizer.Result()).get("text", ""))
                     if text:
@@ -72,13 +83,14 @@ class Listener:
                 raise ValueError("need a 16-bit mono WAV file")
             recognizer = self._recognizer(wav.getframerate())
             heard = []
+            # Feed the file through in chunks, collecting each finished phrase.
             while True:
                 data = wav.readframes(4000)
                 if not data:
                     break
                 if recognizer.AcceptWaveform(data):
                     heard.append(json.loads(recognizer.Result()).get("text", ""))
-            heard.append(json.loads(recognizer.FinalResult()).get("text", ""))
+            heard.append(json.loads(recognizer.FinalResult()).get("text", ""))     # whatever was left at the end
         return _clean(" ".join(heard))
 
 
@@ -97,5 +109,5 @@ def strip_wake_word(text: str, wake_word: Optional[str] = "eddy") -> Optional[st
     for i, w in enumerate(words):
         if w in variants:
             rest = " ".join(words[i + 1:]).strip()
-            return rest or None
-    return None
+            return rest or None     # the wake word alone is not a command
+    return None                     # no wake word: not addressed to Eddy

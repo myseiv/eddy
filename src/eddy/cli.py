@@ -1,4 +1,9 @@
-"""The `eddy` command."""
+"""The `eddy` command.
+
+Each sub-command (`eddy scan`, `eddy shell`, ...) is one cmd_* function below. main() at the
+bottom defines the options and calls the right one. A cmd_* function returns the exit
+code: 0 for success, 1 if something the user asked for did not work.
+"""
 from __future__ import annotations
 
 import argparse
@@ -17,12 +22,15 @@ from .senses.speak import Speaker
 
 
 def _eddy(args, speaker: str = "print") -> Eddy:
+    """Build an Eddy for the robot and safety options given on the command line.
+    Not every sub-command has --speed and --min-range, hence the getattr defaults."""
     adapter = open_robot(args.robot)
     safety = Safety(speed_scale=getattr(args, "speed", 1.0), min_range=getattr(args, "min_range", 0.25))
     return Eddy(adapter, Speaker(speaker), safety)
 
 
 def cmd_scan(args) -> int:
+    """`eddy scan`: list the robots reachable from this machine."""
     print("Robots Eddy can attach to from here:\n")
     for spec, note in scan():
         print(f"  {spec:<28} {note}")
@@ -31,12 +39,14 @@ def cmd_scan(args) -> int:
 
 
 def cmd_info(args) -> int:
+    """`eddy info`: connect to a robot and print what it can do."""
     with _eddy(args) as eddy:
         print(eddy.model.summary())
     return 0
 
 
 def cmd_do(args) -> int:
+    """`eddy do "<sentence>" ...`: carry out each sentence in order, then exit."""
     ok = True
     with _eddy(args, "auto" if args.speak else "print") as eddy:
         for sentence in args.sentence:
@@ -47,6 +57,7 @@ def cmd_do(args) -> int:
 
 
 def cmd_shell(args) -> int:
+    """`eddy shell`: an interactive prompt; each line typed is a command for the robot."""
     with _eddy(args, "auto" if args.speak else "print") as eddy:
         print(eddy.model.summary())
         print('\nType what you want the robot to do ("drive forward 1 meter", "turn left", "reach 0.2 0 0.3",\n'
@@ -54,7 +65,7 @@ def cmd_shell(args) -> int:
         while True:
             try:
                 line = input("eddy> ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt):      # Ctrl-D or Ctrl-C leaves the shell
                 print()
                 break
             if line in ("quit", "exit"):
@@ -65,13 +76,16 @@ def cmd_shell(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    """`eddy serve`: put this machine's robot on the network so another machine can drive it."""
     from .adapters.line import LineServer
     adapter = open_robot(args.robot)
+    # The simulator normally runs on its own clock; served over the network it must move in real time.
     if hasattr(adapter, "go_live"):
         adapter.go_live()
     server = LineServer(adapter, port=args.port).start()
     print(f"Serving {server.model.name} on port {server.port}. Connect with:  eddy shell -r tcp:<this-host>:{server.port}",
           flush=True)
+    # The server works in a background thread; this thread just waits for Ctrl-C.
     try:
         while True:
             time.sleep(3600)
@@ -85,10 +99,12 @@ def cmd_run(args) -> int:
     eddy = _eddy(args, "auto" if args.speak else "print")
     eddy.start()
     print(eddy.model.summary(), flush=True)
+    # Print the outcome of every command, whichever sense it came from.
     eddy.listeners.append(lambda result: print(f"  {result}", flush=True))
     threads = []
 
     def background(name, target):
+        """Run a sense in its own thread. If it fails, say so and let the rest keep running."""
         def guarded():
             try:
                 target()
@@ -98,12 +114,14 @@ def cmd_run(args) -> int:
         t.start()
         threads.append(t)
 
+    # --voice: listen on the microphone and act on sentences addressed to Eddy.
     if args.voice:
         from .senses.listen import Listener, strip_wake_word
         listener = Listener(args.voice_model)
         wake = None if args.no_wake_word else "eddy"
 
         def hear():
+            """Thread: every phrase heard, minus the wake word, becomes a command."""
             for phrase in listener.phrases():
                 sentence = strip_wake_word(phrase, wake)
                 if sentence:
@@ -112,16 +130,19 @@ def cmd_run(args) -> int:
         background("voice", hear)
         print("Listening." + ("" if args.no_wake_word else ' Start each command with "Eddy".'), flush=True)
 
+    # --gestures: watch the camera and act on hand signs.
     if args.gestures:
         from .senses.vision import Camera, HandTracker
         camera, tracker = Camera(args.camera), HandTracker()
 
         def watch():
+            """Thread: feed every camera frame's hand landmarks to Eddy."""
             for frame in camera.frames():
                 eddy.sign(tracker.landmarks(frame))
         background("gestures", watch)
         print("Watching for hand signs: palm = stop, point = forward, V = back, thumb sideways = turn.", flush=True)
 
+    # --peers: join the robot-to-robot link.
     node = None
     if args.peers:
         from .link import PeerNode, attach
@@ -132,6 +153,7 @@ def cmd_run(args) -> int:
 
     if args.say:
         eddy.speaker.say(args.say)
+    # With a terminal attached, also take typed commands; as a background service, just keep running.
     try:
         if sys.stdin.isatty():
             print('Type commands too. "quit" to leave.', flush=True)
@@ -152,6 +174,7 @@ def cmd_run(args) -> int:
     except (EOFError, KeyboardInterrupt):
         print()
     finally:
+        # Always leave the network and stop the robot on the way out.
         if node is not None:
             node.stop()
         eddy.close()
@@ -159,6 +182,8 @@ def cmd_run(args) -> int:
 
 
 def cmd_hear(args) -> int:
+    """`eddy hear file.wav`: recognise the speech in a recording and carry it out
+    (tests listening without a microphone)."""
     from .senses.listen import Listener
     text = Listener(args.voice_model).transcribe(args.wav)
     print(f"[heard] {text or '(nothing)'}")
@@ -195,14 +220,17 @@ def cmd_see(args) -> int:
 def cmd_doctor(args) -> int:
     """Say what works on this machine and what is missing."""
     def have(module):
+        """True if this Python package is installed."""
         return importlib.util.find_spec(module) is not None
 
     def row(ok, label, note=""):
+        """Print one line of the report."""
         print(f"  [{'ok' if ok else '--'}] {label:<26} {note}")
 
     print(f"Eddy AI {__version__}\n")
     machine = platform.machine()
     board = ""
+    # On a Raspberry Pi (and other ARM boards) this file holds the board's name.
     try:
         with open("/proc/device-tree/model") as f:
             board = f.read().strip("\x00\n ")
@@ -226,6 +254,7 @@ def cmd_doctor(args) -> int:
         else "pip install 'eddy-ai[voice]'")
     row(have("cv2"), "see (camera)", "" if have("cv2") else "pip install 'eddy-ai[vision]'")
     row(have("mediapipe"), "hand signs", "" if have("mediapipe") else "pip install 'eddy-ai[vision]'")
+    # On Linux, cameras show up as /dev/video0, /dev/video1, ...
     cams = [d for d in (os.listdir("/dev") if os.path.isdir("/dev") else []) if d.startswith("video")]
     if platform.system() == "Linux":
         row(bool(cams), "camera device", ", ".join(sorted(cams)[:4]) or "none found under /dev/video*")
@@ -234,21 +263,25 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_selftest(args) -> int:
+    """`eddy selftest`: run the end-to-end checks on the simulator."""
     from .selftest import run
     return run(verbose=not args.quiet)
 
 
 def main(argv=None) -> int:
+    """Parse the command line and run the chosen sub-command. Returns the exit code."""
     parser = argparse.ArgumentParser(prog="eddy", description="Eddy AI: one controller for any robot.")
     parser.add_argument("--version", action="version", version=f"eddy {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     def robot_arg(p):
+        """Add the options shared by every sub-command that talks to a robot."""
         p.add_argument("-r", "--robot", default=os.environ.get("EDDY_ROBOT", "auto"),
                        help="sim, ros2, serial:<port>[@baud], tcp:<host>:<port>, or auto (default)")
         p.add_argument("--speed", type=float, default=1.0, help="scale every speed, e.g. 0.5 for half")
         p.add_argument("--min-range", type=float, default=0.25, help="stop this far (m) from obstacles ahead")
 
+    # One parser per sub-command; set_defaults(fn=...) records which function runs it.
     sub.add_parser("doctor", help="check what works on this machine").set_defaults(fn=cmd_doctor)
     sub.add_parser("scan", help="list robots Eddy can attach to").set_defaults(fn=cmd_scan)
     p = sub.add_parser("info", help="show what a robot can do")
@@ -301,8 +334,9 @@ def main(argv=None) -> int:
     try:
         return args.fn(args)
     except KeyboardInterrupt:
-        return 130
+        return 130      # the conventional exit code for "interrupted with Ctrl-C"
     except (RuntimeError, ValueError, OSError, TimeoutError) as exc:
+        # Expected problems (robot not found, missing package, ...): one clear line, no traceback.
         print(f"eddy: {exc}", file=sys.stderr)
         return 2
 

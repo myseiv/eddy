@@ -17,10 +17,18 @@ from .base import Adapter
 
 
 def open_robot(spec: str = "auto") -> Adapter:
+    """Turn a spec string into the right adapter. The adapter is not connected yet.
+
+    Each adapter module is imported only when its kind is asked for, so a machine
+    without ROS or pyserial can still use the others.
+    """
     spec = (spec or "auto").strip()
+    # "auto": take the first real robot the scan finds; fall back to the simulator.
     if spec == "auto":
         found = [s for s, _ in scan() if s != "sim"]
         spec = found[0] if found else "sim"
+    # Whatever follows the colon is the adapter's own option:
+    # "sim:<name>" names the simulated robot, "ros2:<topic>" forces the velocity topic.
     if spec == "sim" or spec.startswith("sim:"):
         from .sim import SimAdapter
         return SimAdapter(name=spec.partition(":")[2] or "sim-rover")
@@ -34,6 +42,7 @@ def open_robot(spec: str = "auto") -> Adapter:
 
 
 def ros2_available() -> bool:
+    """True if this shell has a ROS 2 environment sourced and its Python library can be imported."""
     return bool(os.environ.get("ROS_DISTRO")) and importlib.util.find_spec("rclpy") is not None
 
 
@@ -42,14 +51,16 @@ def scan(probe_serial: bool = True) -> List[Tuple[str, str]]:
     found: List[Tuple[str, str]] = []
     if ros2_available():
         found.append(("ros2", f"ROS 2 {os.environ.get('ROS_DISTRO')} graph on this machine"))
+    # Serial ports can only be listed if pyserial is installed.
     if importlib.util.find_spec("serial") is not None:
         from serial.tools import list_ports
         from .line import LineAdapter
         for port in list_ports.comports():
             if "bluetooth" in port.device.lower():
-                continue
+                continue        # macOS lists Bluetooth pseudo-ports; they are never robots
             spec, note = f"serial:{port.device}", port.description or "serial device"
             if probe_serial:
+                # Try the Eddy handshake to learn whether the device really is an Eddy robot.
                 adapter = LineAdapter(spec, timeout=2.5)
                 try:
                     note = f"{adapter.connect().name} (answers Eddy protocol)"
@@ -61,5 +72,6 @@ def scan(probe_serial: bool = True) -> List[Tuple[str, str]]:
                     except Exception:
                         pass
             found.append((spec, note))
+    # The simulator is always available, and always listed last.
     found.append(("sim", "built-in simulated rover with a 4-joint arm"))
     return found
