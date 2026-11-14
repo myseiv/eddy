@@ -12,6 +12,8 @@ from eddy.adapters.line import LineAdapter, LineServer
 from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits
 from eddy.adapters.sim import SimAdapter
 from eddy.kinematics import Chain, demo_arm
+from eddy.brain import Eddy
+from eddy.senses.speak import Speaker
 from eddy.model import Drive, Gripper, Home, MoveTo, Report, Say, SetJoints, Stop, Unsupported, Wander
 
 # A small robot description used by several tests: two wheels (continuous joints) and a
@@ -148,6 +150,19 @@ def test_sentences(text, expected):
 def test_unknown_sentences_do_nothing(text):
     """Anything Eddy does not understand becomes no command at all."""
     assert intents.parse(text) is None
+
+
+def test_joints_can_be_named_loosely():
+    """A joint can be named exactly, without capitals, by its number, or by a unique word in
+    its name; an ambiguous word matches nothing."""
+    from eddy.model import JointSpec, RobotModel
+    model = RobotModel("r", joints=[JointSpec("joint1"), JointSpec("joint2"), JointSpec("Elbow_Pitch"),
+                                    JointSpec("gripper_left"), JointSpec("gripper_right")])
+    assert model.find_joint("joint1").name == "joint1"
+    assert model.find_joint("1").name == "joint1"
+    assert model.find_joint("elbow_pitch").name == "Elbow_Pitch"
+    assert model.find_joint("elbow").name == "Elbow_Pitch"
+    assert model.find_joint("gripper") is None and model.find_joint("wrist") is None
 
 
 def test_stop_wins_inside_a_longer_sentence():
@@ -344,3 +359,28 @@ def test_line_adapter_rejects_a_non_eddy_device():
     with pytest.raises(Exception):
         LineAdapter(f"tcp:127.0.0.1:{listener.getsockname()[1]}").connect()
     listener.close()
+
+
+def test_a_robot_that_cannot_turn_on_the_spot_is_turned_while_rolling():
+    sim = SimAdapter(car=True, arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        first = eddy.execute(Drive(angular=0.8, angle=math.pi / 2))
+        assert first.ok and "cannot turn on the spot" in first.message, first.message
+        assert abs(abs(sim.heading) - math.pi / 2) < 0.1
+        assert eddy.model.drive.kind == "car-like"
+        # The second turn does not waste time trying on the spot again.
+        before = sim.clock
+        assert eddy.execute(Drive(angular=-0.8, angle=math.pi / 2)).ok
+        assert sim.clock - before < 6 and abs(sim.heading) < 0.1
+
+
+def test_a_drive_with_no_effect_is_given_up_quickly():
+    class Dead(SimAdapter):
+        def set_velocity(self, linear, angular):
+            pass
+    sim = Dead(arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.execute(Drive(linear=0.2, distance=1.0))
+        assert not r.ok and "no effect" in r.message and sim.clock < 3
+        r = eddy.execute(Drive(angular=0.8, angle=1.0))
+        assert not r.ok and "heading did not change" in r.message

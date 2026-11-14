@@ -39,6 +39,11 @@ class Result:
         return self.message
 
 
+CAR = "car-like"    # DriveSpec.kind of a robot found unable to turn on the spot
+CREEP = 0.12        # m/s: forward speed used to turn such a robot
+STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
+
+
 def _wrap(a: float) -> float:
     """Bring an angle into -pi..pi, so heading differences across the +/-180 line stay small."""
     return math.atan2(math.sin(a), math.cos(a))
@@ -219,6 +224,12 @@ class Eddy:
         else:
             goal, budget = None, cmd.duration if cmd.duration is not None else 1.0
         budget = min(budget, self.safety.max_drive_seconds)
+        # A turn with no forward speed asks the robot to turn on the spot. A robot that steers
+        # like a car cannot; once Eddy has seen that (below) it creeps forward while turning.
+        spot_turn = abs(ang) > 0 and lin == 0
+        arc = spot_turn and self.model.drive.kind == CAR
+        if arc:
+            lin = self._limits(CREEP, 0.0)[0]
         if self._blocked(lin):
             raise Refused("something is too close in front of me")
 
@@ -228,6 +239,7 @@ class Eddy:
         deadline = budget * 2 + 2 if odometry else budget   # with odometry, time is only a backstop
         tick = self.safety.tick
         last_heading, turned, travelled, elapsed, why = start.heading, 0.0, 0.0, 0.0, "done"
+        stall_at = STALL            # when to check that the robot has started to respond
         try:
             # Control loop: every tick, check for a newer command and for obstacles, measure
             # progress, and re-send the velocity (robots with a command timeout need that).
@@ -248,6 +260,19 @@ class Eddy:
                     left = goal - (travelled if cmd.distance is not None else turned)
                     if left <= 0.004:
                         break
+                    # Nothing at all has happened for a while: the command is not having an effect.
+                    if elapsed >= stall_at and (travelled if cmd.distance is not None else turned) < \
+                            (0.005 if cmd.distance is not None else math.radians(2)):
+                        if spot_turn and not arc and cmd.angle is not None and not self._blocked(CREEP):
+                            # Perhaps it steers like a car: try again, rolling forward while turning.
+                            arc, lin = True, self._limits(CREEP, 0.0)[0]
+                            stall_at = elapsed + STALL
+                            deadline += STALL
+                            continue
+                        why = "stalled"
+                        break
+                    if arc and self.model.drive.kind != CAR and turned >= math.radians(5):
+                        self.model.drive.kind = CAR     # it worked: remember for the next turn
                     ease = 0.15 if cmd.distance is not None else 0.35   # slow down near the goal
                     scale = max(0.2, min(1.0, left / ease))
                 self.adapter.set_velocity(lin * scale, ang * scale)
@@ -269,13 +294,22 @@ class Eddy:
                 turned += abs(_wrap(end.heading - last_heading))    # include any coasting after the stop
             else:
                 turned = abs(_wrap(end.heading - start.heading))
-            what = (f"turned {math.degrees(turned):.0f} degrees" if abs(ang) > 0 and abs(lin) == 0
+            what = (f"turned {math.degrees(turned):.0f} degrees" if spot_turn
                     else f"moved {moved:.2f} m")
+            if arc and self.model.drive.kind == CAR:
+                what += f", rolling forward {moved:.2f} m because this robot cannot turn on the spot"
         else:
             what = f"drove for {elapsed:.1f} s"
         if why == "blocked":
             self.speaker.say("Something is in my way.")
             return f"Stopped early, something is in the way ({what})."
+        if why == "stalled":
+            if spot_turn:
+                raise Refused("the turn had no effect: the heading did not change, on the spot or while "
+                              "rolling forward. Either the wheels are not turning the robot, or its "
+                              "odometry does not report its heading.")
+            raise Refused("the command had no effect: the robot's odometry shows no movement. "
+                          "Is it free to move, and is this the right velocity topic?")
         if why == "timeout":
             asked = f"{goal:.2f} m" if cmd.distance is not None else f"{math.degrees(goal):.0f} degrees"
             raise Refused(f"I ran out of time: I only {what} of the {asked} asked for. "
@@ -342,10 +376,11 @@ class Eddy:
         # Check every name and clamp every value to that joint's limits.
         targets = {}
         for name, value in positions.items():
-            spec = self.model.joint(name)
+            spec = self.model.find_joint(name)
             if spec is None:
-                raise Refused(f"there is no joint called {name}")
-            targets[name] = max(spec.lower, min(spec.upper, float(value)))
+                known = ", ".join(j.name for j in self.model.joints)
+                raise Refused(f"there is no single joint called {name} (this robot has: {known})")
+            targets[spec.name] = max(spec.lower, min(spec.upper, float(value)))
         # Give the move enough time that the joint with furthest to go stays under 1 rad/s.
         now = self.adapter.state().joints
         biggest = max((abs(targets[n] - now.get(n, 0.0)) for n in targets), default=0.0)
@@ -370,5 +405,12 @@ class Eddy:
         else:
             # The loop ran out of time without a break, i.e. the joints never arrived.
             if feedback:
-                raise Refused("the joints did not reach their targets in time")
+                # Say what each joint actually did, so it is clear whether the arm never
+                # moved, moved part of the way, or arrived but outside the tolerance.
+                current = self.adapter.state().joints
+                detail = "; ".join(
+                    f"{n} went from {math.degrees(now.get(n, 0.0)):.1f} to "
+                    f"{math.degrees(current.get(n, float('nan'))):.1f} degrees, wanted {math.degrees(targets[n]):.1f}"
+                    for n in targets if abs(current.get(n, 1e9) - targets[n]) >= 0.02)
+                raise Refused(f"the joints did not reach their targets in time ({detail})")
         return f"{label} set."

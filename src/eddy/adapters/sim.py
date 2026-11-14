@@ -21,8 +21,9 @@ class SimAdapter(Adapter):
     kind = "sim"
 
     def __init__(self, name: str = "sim-rover", room: float = 2.0, realtime: bool = False,
-                 arm: bool = True, drive: bool = True):
+                 arm: bool = True, drive: bool = True, car: bool = False):
         self.name = name
+        self.car = car              # True: steers like a car, so it cannot turn without rolling
         self.room = room            # walls at +/- room metres
         self.radius = 0.15          # the rover's own radius, metres
         self.realtime = realtime    # True: wait() also sleeps for real, so motion can be watched
@@ -140,7 +141,9 @@ class SimAdapter(Adapter):
             remaining -= dt
             self.clock += dt
             # Turn first (keeping the heading within -pi..pi), then move along the new heading.
-            self.heading = math.atan2(math.sin(self.heading + self.w * dt), math.cos(self.heading + self.w * dt))
+            # A car can only turn as fast as its speed allows (0.25 m tightest turning circle).
+            w = max(-abs(self.v) / 0.25, min(abs(self.v) / 0.25, self.w)) if self.car else self.w
+            self.heading = math.atan2(math.sin(self.heading + w * dt), math.cos(self.heading + w * dt))
             nx = self.x + self.v * math.cos(self.heading) * dt
             ny = self.y + self.v * math.sin(self.heading) * dt
             limit = self.room - self.radius

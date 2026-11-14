@@ -67,6 +67,23 @@ class RobotModel:
                 return j
         return None
 
+    def find_joint(self, name: str) -> Optional[JointSpec]:
+        """Look up a joint the way a person would name it: exact name first, then ignoring
+        capitals, then "1" for "joint1", then any single joint whose name contains the word.
+        None if nothing matches, or if more than one joint would."""
+        exact = self.joint(name)
+        if exact is not None:
+            return exact
+        wanted = name.lower()
+        for candidates in ([j for j in self.joints if j.name.lower() == wanted],
+                           [j for j in self.joints if j.name.lower() == "joint" + wanted],
+                           [j for j in self.joints if wanted in j.name.lower()]):
+            if len(candidates) == 1:
+                return candidates[0]
+            if candidates:
+                return None         # ambiguous: do not guess which joint was meant
+        return None
+
     def summary(self) -> str:
         """A multi-line, human-readable description (what `eddy info` prints)."""
         lines = [f"robot: {self.name}  (via {self.kind})",

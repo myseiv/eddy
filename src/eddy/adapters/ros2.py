@@ -330,8 +330,11 @@ class Ros2Adapter(Adapter):
                 commandable.update(c["joints"])
         arm_joints = [j for c in self._controllers.values() if not c["gripper"] for j in c["joints"]]
         # Joint list with limits from the URDF (or a full turn if the URDF does not know the joint).
+        # Only joints a controller can move are listed: a joint that is merely reported (a wheel,
+        # say) is not something Eddy can position. A controller's joint is listed even when
+        # the robot does not report its position.
         joints = []
-        for n in names:
+        for n in [n for n in names if n in commandable] + sorted(commandable - set(names)):
             lower, upper, kind = self._limits.get(n, (-math.pi, math.pi, "revolute"))
             joints.append(JointSpec(n, lower, upper, kind))
         # Arm geometry for inverse kinematics, using only joints an arm controller can move.
