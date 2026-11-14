@@ -8,6 +8,7 @@ and a latched /robot_description. Its physics is Eddy's simulator.
 Like a real base, it stops if velocity commands stop arriving for half a second.
 """
 import math
+import os
 import time
 
 import rclpy
@@ -120,7 +121,20 @@ class TrajectoryController(Node):
         self.joints, self.apply = joints, apply
         # Real controllers expose their joints as a parameter; Eddy reads it to learn them.
         self.declare_parameter("joints", joints)
-        self.create_subscription(JointTrajectory, f"/{name}/joint_trajectory", self.on_trajectory, 10)
+        if os.environ.get("EDDY_MOCK_ACTIONS"):
+            # Action mode: take trajectories as FollowJointTrajectory goals, as many real arms do.
+            from control_msgs.action import FollowJointTrajectory
+            from rclpy.action import ActionServer
+            self._result = FollowJointTrajectory.Result
+            self.server = ActionServer(self, FollowJointTrajectory, f"/{name}/follow_joint_trajectory", self.on_goal)
+        else:
+            self.create_subscription(JointTrajectory, f"/{name}/joint_trajectory", self.on_trajectory, 10)
+
+    def on_goal(self, goal_handle):
+        """An action goal arrived: apply its trajectory and report success."""
+        self.on_trajectory(goal_handle.request.trajectory)
+        goal_handle.succeed()
+        return self._result()
 
     def on_trajectory(self, msg: JointTrajectory):
         """Apply the last point of a trajectory, if it names exactly this controller's joints."""
@@ -147,6 +161,8 @@ def main():
         executor.spin()
     except KeyboardInterrupt:
         pass
+    except Exception as exc:            # killed mid-publish by the test script: not a failure
+        print(f"mock robot stopped ({type(exc).__name__})", flush=True)
 
 
 if __name__ == "__main__":

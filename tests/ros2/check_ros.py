@@ -30,8 +30,9 @@ check("reads the graph and finds what the robot can do",
 check("picks /cmd_vel, not the Twist topic nobody listens to", model.details.get("cmd_vel") == "/cmd_vel")
 check("names the robot from its URDF", model.name == "mockbot")
 check("learns each controller's joints from the controller itself",
-      adapter._controllers["/arm_controller/joint_trajectory"]["joints"] == ["base_yaw", "shoulder", "elbow", "wrist"]
-      and adapter._controllers["/gripper_controller/joint_trajectory"]["joints"] == ["finger"])
+      [c["joints"] for c in adapter._controllers.values() if not c["gripper"]] == [["base_yaw", "shoulder", "elbow", "wrist"]]
+      and [c["joints"] for c in adapter._controllers.values() if c["gripper"]] == [["finger"]],
+      ", ".join(adapter._controllers))
 check("reads joint limits from the URDF", model.joint("shoulder").lower == -1.9 and model.joint("finger").upper == 0.04)
 check("builds the arm chain without the gripper finger or wheels",
       model.chain.joint_names == ["base_yaw", "shoulder", "elbow", "wrist"] and abs(model.chain.reach() - 0.63) < 1e-6)

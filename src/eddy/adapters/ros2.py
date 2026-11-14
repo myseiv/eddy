@@ -27,16 +27,19 @@ JOINT_STATE = "sensor_msgs/msg/JointState"              # current joint position
 TRAJECTORY = "trajectory_msgs/msg/JointTrajectory"      # joint targets for a controller
 IMAGES = ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")
 STRING = "std_msgs/msg/String"                          # used for the robot's URDF
+FOLLOW = "control_msgs/action/FollowJointTrajectory"    # joint targets for a controller, as an action
 
 
 def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
                    sub_counts: Optional[Dict[str, int]] = None,
-                   pub_counts: Optional[Dict[str, int]] = None) -> Dict[str, object]:
+                   pub_counts: Optional[Dict[str, int]] = None,
+                   actions: Optional[Iterable[Tuple[str, Sequence[str]]]] = None) -> Dict[str, object]:
     """Decide what each topic on a robot is for.
 
     topics: (name, [types]) pairs as returned by node.get_topic_names_and_types().
     sub_counts / pub_counts: how many nodes listen to / publish each topic, when known.
     A command topic nobody listens to is ranked last; so is a sensor topic nobody publishes.
+    actions: (name, [types]) pairs for the ROS actions on the graph, when known.
     """
     sub_counts, pub_counts = sub_counts or {}, pub_counts or {}
     # Group topic names by message type.
@@ -45,8 +48,10 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
         for t in types:
             by_type.setdefault(t, []).append(name)
 
-    def pick(names: List[str], preferred: str, counts: Dict[str, int], known: bool) -> Optional[str]:
-        """Choose the most likely topic among several of the same type."""
+    def pick(names: List[str], preferred: str, counts: Dict[str, int], known: bool,
+             used: Optional[Dict[str, int]] = None) -> Optional[str]:
+        """Choose the most likely topic among several of the same type.
+        used: for a command topic, how many of the robot's own nodes already publish to it."""
         if not names:
             return None
 
@@ -54,6 +59,7 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
             """Sort key: lower is better. False sorts before True."""
             last = n.rsplit("/", 1)[-1]
             return (known and counts.get(n, 0) == 0,   # nobody on the other end
+                    bool(used) and used.get(n, 0) == 0,   # the robot's own software does not use it
                     last != preferred,                 # not the conventional name
                     preferred not in n,
                     n.count("/"), len(n), n)           # then shallowest, shortest, alphabetical
@@ -67,7 +73,9 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
         # Only topics that look like velocity commands, unless there is exactly one Twist topic.
         named = [n for n in types if "cmd_vel" in n or "cmd" in n.rsplit("/", 1)[-1]]
         pool = named or (list(types) if len(types) == 1 else [])
-        best = pick(pool, "cmd_vel", sub_counts, bool(sub_counts))
+        # Where two topics both reach the motors, take the one the robot's own programs publish
+        # to. (Seen on a real robot: a second topic meant for a phone app, with speeds scaled down.)
+        best = pick(pool, "cmd_vel", sub_counts, bool(sub_counts), pub_counts)
         if best:
             profile["cmd_vel"] = (best, types[best])
     # Sensors: one topic each for odometry, laser scan and joint states.
@@ -82,6 +90,14 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
     grippers = [n for n in trajectories if any(w in n.lower() for w in ("gripper", "hand", "claw"))]
     profile["arm_trajectories"] = [n for n in trajectories if n not in grippers]
     profile["gripper_trajectories"] = grippers
+    # Controllers that take their trajectory as an action rather than on a topic (many real
+    # arms do). A controller that offers both is used through its topic, so it is not listed twice.
+    topic_owners = {n.rsplit("/", 1)[0] for n in trajectories}
+    follow = sorted(n for n, types in (actions or [])
+                    if FOLLOW in types and n.rsplit("/", 1)[0] not in topic_owners)
+    gripper_actions = [n for n in follow if any(w in n.lower() for w in ("gripper", "hand", "claw"))]
+    profile["arm_actions"] = [n for n in follow if n not in gripper_actions]
+    profile["gripper_actions"] = gripper_actions
     profile["cameras"] = sorted(n for t in IMAGES for n in by_type.get(t, []))
     # The URDF is published as a String on a topic called robot_description.
     descriptions = [n for n in by_type.get(STRING, []) if n.rsplit("/", 1)[-1] == "robot_description"]
@@ -143,7 +159,7 @@ class Ros2Adapter(Adapter):
         self._lock = threading.Lock()             # guards _state and _urdf (written by the ROS thread)
         self._urdf: Optional[str] = None
         self._seen = set()                        # which sensors have delivered a first message
-        self._controllers: Dict[str, dict] = {}   # topic -> {"pub": publisher, "joints": [...]}
+        self._controllers: Dict[str, dict] = {}   # topic or action name -> {"pub" or "client", "joints", "gripper"}
         self._limits: Dict[str, Tuple[float, float, str]] = {}
         self._we_started_rclpy = False
 
@@ -175,7 +191,8 @@ class Ros2Adapter(Adapter):
         me = self.node.get_name()
         subs = {n: self.node.count_subscribers(n) for n, _ in topics}
         pubs = {n: self.node.count_publishers(n) for n, _ in topics}
-        self.profile = classify_graph(topics, subs, pubs)
+        from rclpy.action import get_action_names_and_types
+        self.profile = classify_graph(topics, subs, pubs, get_action_names_and_types(self.node))
         if self.cmd_vel_override:
             types = dict((n, t[0]) for n, t in topics)
             self.profile["cmd_vel"] = (self.cmd_vel_override, types.get(self.cmd_vel_override, TWIST))
@@ -232,6 +249,20 @@ class Ros2Adapter(Adapter):
                 "joints": self._controller_joints(topic),
                 "gripper": topic in p["gripper_trajectories"],
             }
+        # And one action client per controller that is driven by an action instead.
+        actions = list(p["arm_actions"]) + list(p["gripper_actions"])
+        if actions:
+            try:
+                from control_msgs.action import FollowJointTrajectory
+                from rclpy.action import ActionClient
+            except ImportError:
+                actions = []        # the action type is not installed here: leave those controllers alone
+            for name in actions:
+                self._controllers[name] = {
+                    "client": ActionClient(node, FollowJointTrajectory, name),
+                    "joints": self._controller_joints(name),
+                    "gripper": name in p["gripper_actions"],
+                }
         # Give the first message of everything we subscribed to a moment to arrive. Without
         # this, a command sent straight after connecting would act before the first laser
         # scan or odometry reading, i.e. with no obstacle check and no position.
@@ -275,7 +306,7 @@ class Ros2Adapter(Adapter):
 
     def _controller_joints(self, topic: str) -> List[str]:
         """A trajectory controller's joints: ask the controller node for its `joints` parameter."""
-        # The topic is "<controller node>/joint_trajectory", so the node is everything before the last slash.
+        # The topic or action is "<controller node>/<something>", so the node is everything before the last slash.
         owner = topic.rsplit("/", 1)[0] or "/"
         joints = self._param(owner, "joints") if owner != "/" else None
         return list(joints) if isinstance(joints, list) else []
@@ -291,8 +322,10 @@ class Ros2Adapter(Adapter):
             if not c["joints"]:
                 # Guess from the names: gripper-like joints go to a gripper controller,
                 # the remaining unclaimed joints to an arm controller.
-                pool = [n for n in names if n not in commandable]
-                gripperish = [n for n in pool if any(w in n.lower() for w in ("gripper", "finger", "hand", "claw"))]
+                # (wheels, which turn without limit, are never arm or gripper joints)
+                pool = [n for n in names if n not in commandable
+                        and self._limits.get(n, (0.0, 0.0, "revolute"))[2] != "continuous"]
+                gripperish = [n for n in pool if any(w in n.lower() for w in ("gripper", "finger", "jaw", "hand", "claw"))]
                 c["joints"] = gripperish if c["gripper"] else [n for n in pool if n not in gripperish]
                 commandable.update(c["joints"])
         arm_joints = [j for c in self._controllers.values() if not c["gripper"] for j in c["joints"]]
@@ -397,7 +430,23 @@ class Ros2Adapter(Adapter):
         msg = JointTrajectory()
         msg.joint_names = list(controller["joints"])
         msg.points = [point]
-        controller["pub"].publish(msg)
+        if "client" in controller:
+            # Action-driven controller: send the trajectory as a goal. We do not wait for the
+            # result here; the brain watches the joint states to see the move finish.
+            from control_msgs.action import FollowJointTrajectory
+            if not controller["client"].wait_for_server(timeout_sec=1.0):
+                raise Unsupported("the joint controller is not answering")
+            sent = controller["client"].send_goal_async(FollowJointTrajectory.Goal(trajectory=msg))
+            # Give the controller a moment to say whether it takes the goal, so a refusal
+            # (wrong joints, say) is reported instead of passing as a move that happened.
+            deadline = time.time() + 1.0
+            while not sent.done() and time.time() < deadline:
+                time.sleep(0.02)
+            if sent.done() and not sent.result().accepted:
+                raise RuntimeError("the joint controller rejected the move (joints: "
+                                   + ", ".join(controller["joints"]) + ")")
+        else:
+            controller["pub"].publish(msg)
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
         """Hand each joint target to the controller that owns that joint."""
@@ -444,6 +493,9 @@ class Ros2Adapter(Adapter):
             # or the process aborts on exit.
             self._executor.shutdown(timeout_sec=2.0)
             self._spin.join(timeout=2.0)
+            for c in self._controllers.values():
+                if "client" in c:
+                    c["client"].destroy()
             self.node.destroy_node()
             self.node = None
             if self._we_started_rclpy and self._rclpy.ok():

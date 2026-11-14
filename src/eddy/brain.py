@@ -254,6 +254,11 @@ class Eddy:
                 step = min(tick, deadline - elapsed)
                 self.adapter.wait(step)
                 elapsed += step
+            else:
+                # The loop ran out of time. With odometry that means the goal was never
+                # reached (the robot is stuck, lifted, or its odometry is not registering).
+                if odometry:
+                    why = "timeout"
         finally:
             self.adapter.stop()     # whatever happened, never leave the robot moving
         # Work out what actually happened, for the report.
@@ -271,6 +276,10 @@ class Eddy:
         if why == "blocked":
             self.speaker.say("Something is in my way.")
             return f"Stopped early, something is in the way ({what})."
+        if why == "timeout":
+            asked = f"{goal:.2f} m" if cmd.distance is not None else f"{math.degrees(goal):.0f} degrees"
+            raise Refused(f"I ran out of time: I only {what} of the {asked} asked for. "
+                          "Is the robot free to move, and is its odometry registering the motion?")
         if why == "interrupted":
             return f"Interrupted ({what})."
         return f"Done: {what}."

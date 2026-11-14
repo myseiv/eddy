@@ -12,7 +12,7 @@ from eddy.adapters.line import LineAdapter, LineServer
 from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits
 from eddy.adapters.sim import SimAdapter
 from eddy.kinematics import Chain, demo_arm
-from eddy.model import Drive, Gripper, Home, MoveTo, Report, Say, Stop, Unsupported, Wander
+from eddy.model import Drive, Gripper, Home, MoveTo, Report, Say, SetJoints, Stop, Unsupported, Wander
 
 # A small robot description used by several tests: two wheels (continuous joints) and a
 # three-joint arm (pan, lift, elbow) ending in a fixed tool link.
@@ -125,6 +125,9 @@ def test_urdf_with_rotated_origin():
     ("go home", Home()),
     ("reach 0.2 0 0.3", MoveTo(0.2, 0.0, 0.3)),
     ("move the arm to 20 -5 30 cm", MoveTo(0.2, -0.05, 0.3)),
+    ("set joint1 to 0.3", SetJoints({"joint1": 0.3})),
+    ("move joint elbow to 90 degrees", SetJoints({"elbow": math.pi / 2})),
+    ("set gripper_base_joint to -20 deg", SetJoints({"gripper_base_joint": math.radians(-20)})),
     ("say Hello World", Say("Hello World")),
     ("status", Report()),
     ("explore for 30 seconds", Wander(30.0)),
@@ -221,12 +224,40 @@ def test_classify_prefers_the_topic_someone_listens_to():
     assert p["cmd_vel"] == ("/diff_drive_controller/cmd_vel", TWIST_STAMPED)
 
 
+def test_classify_prefers_the_topic_the_robots_own_software_uses():
+    """Seen on a Hiwonder LanderPi: two velocity topics both reach the motors, but the robot's
+    own programs all publish to one of them. That one wins over the better-named one."""
+    topics = [("/cmd_vel", [TWIST]), ("/controller/cmd_vel", [TWIST])]
+    p = classify_graph(topics, sub_counts={"/cmd_vel": 1, "/controller/cmd_vel": 1},
+                       pub_counts={"/cmd_vel": 0, "/controller/cmd_vel": 5})
+    assert p["cmd_vel"][0] == "/controller/cmd_vel"
+    # With nothing to tell them apart, the conventional name still wins.
+    p = classify_graph(topics, sub_counts={"/cmd_vel": 1, "/controller/cmd_vel": 1},
+                       pub_counts={"/cmd_vel": 0, "/controller/cmd_vel": 0})
+    assert p["cmd_vel"][0] == "/cmd_vel"
+
+
 def test_classify_does_not_guess_among_unrelated_twists():
     """Several Twist topics that do not look like velocity commands are left alone; a single cmd_vel is used."""
     p = classify_graph([("/wind", [TWIST]), ("/current", [TWIST])])
     assert "cmd_vel" not in p
     assert classify_graph([("/turtle1/cmd_vel", [TWIST])])["cmd_vel"][0] == "/turtle1/cmd_vel"
     assert classify_graph([])["arm_trajectories"] == []
+
+
+def test_classify_finds_action_driven_controllers():
+    """Controllers offered as FollowJointTrajectory actions are found; one that also has a
+    trajectory topic is used through the topic and not listed twice."""
+    follow = ["control_msgs/action/FollowJointTrajectory"]
+    actions = [("/arm_controller/follow_joint_trajectory", follow),
+               ("/gripper_controller/follow_joint_trajectory", follow),
+               ("/navigate_to_pose", ["nav2_msgs/action/NavigateToPose"])]
+    p = classify_graph([("/cmd_vel", [TWIST])], actions=actions)
+    assert p["arm_actions"] == ["/arm_controller/follow_joint_trajectory"]
+    assert p["gripper_actions"] == ["/gripper_controller/follow_joint_trajectory"]
+    both = classify_graph([("/arm_controller/joint_trajectory", ["trajectory_msgs/msg/JointTrajectory"])], actions=actions)
+    assert both["arm_actions"] == [] and both["arm_trajectories"] == ["/arm_controller/joint_trajectory"]
+    assert classify_graph([])["arm_actions"] == []
 
 
 def test_front_range():

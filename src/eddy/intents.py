@@ -9,7 +9,7 @@ import math
 import re
 from typing import Optional
 
-from .model import Drive, Gripper, Home, MoveTo, Report, Say, Stop, Wander
+from .model import Drive, Gripper, Home, MoveTo, Report, Say, SetJoints, Stop, Wander
 
 # Number words and the value each stands for, so "two meters" works as well as "2 meters".
 _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -76,6 +76,13 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
 
     if re.search(r"\b(status|where are you|what are you|who are you|report|what can you do)\b", t):
         return Report()
+
+    # One joint on its own: "set joint1 to 0.3", "move joint elbow to 20 degrees".
+    # The value is radians unless the sentence says degrees.
+    m = re.search(r"\b(?:joint\s+(\w+)|(\w*joint\w*))\s+(?:to\s+)?(-?\d+(?:\.\d+)?)\s*(deg|degree|degrees)?\b", t)
+    if m:
+        value = float(m.group(3))
+        return SetJoints({m.group(1) or m.group(2): math.radians(value) if m.group(4) else value})
 
     # Gripper: "open the gripper", "let go", "grab", ...
     if re.search(r"\b(open)\b.*\b(gripper|hand|claw)\b|\b(release|let go|drop)\b", t):
