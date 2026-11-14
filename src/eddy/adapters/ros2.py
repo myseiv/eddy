@@ -142,6 +142,7 @@ class Ros2Adapter(Adapter):
         self._state = RobotState()                # latest values from the subscriptions
         self._lock = threading.Lock()             # guards _state and _urdf (written by the ROS thread)
         self._urdf: Optional[str] = None
+        self._seen = set()                        # which sensors have delivered a first message
         self._controllers: Dict[str, dict] = {}   # topic -> {"pub": publisher, "joints": [...]}
         self._limits: Dict[str, Tuple[float, float, str]] = {}
         self._we_started_rclpy = False
@@ -231,13 +232,16 @@ class Ros2Adapter(Adapter):
                 "joints": self._controller_joints(topic),
                 "gripper": topic in p["gripper_trajectories"],
             }
-        # Give the first messages (description, joint states, odometry) a moment to arrive.
+        # Give the first message of everything we subscribed to a moment to arrive. Without
+        # this, a command sent straight after connecting would act before the first laser
+        # scan or odometry reading, i.e. with no obstacle check and no position.
         deadline = time.time() + 2.0
         while time.time() < deadline:
             with self._lock:
                 have_desc = "description" not in p or self._urdf is not None
                 have_joints = "joint_states" not in p or bool(self._state.joints)
-            if have_desc and have_joints:
+                have_sensors = all(k not in p or k in self._seen for k in ("odom", "scan"))
+            if have_desc and have_joints and have_sensors:
                 break
             time.sleep(0.05)
         # No URDF on a topic: ask robot_state_publisher, which holds it as a parameter.
@@ -337,12 +341,14 @@ class Ros2Adapter(Adapter):
         with self._lock:
             self._state.x, self._state.y = msg.pose.pose.position.x, msg.pose.pose.position.y
             self._state.heading, self._state.has_odometry = yaw, True
+            self._seen.add("odom")
 
     def _on_scan(self, msg) -> None:
         """Laser scan: keep only the distance to the nearest thing straight ahead."""
         r = front_range(msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max)
         with self._lock:
             self._state.range_ahead = r
+            self._seen.add("scan")
 
     def _on_joints(self, msg) -> None:
         """Joint states: keep each joint's position."""
