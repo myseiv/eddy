@@ -9,7 +9,7 @@ import pytest
 
 from eddy import gestures, intents
 from eddy.adapters.line import LineAdapter, LineServer
-from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits
+from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits, urdf_mimics, cloud_front_range
 from eddy.adapters.sim import SimAdapter
 from eddy.kinematics import Chain, demo_arm
 from eddy.brain import Eddy
@@ -384,3 +384,93 @@ def test_a_drive_with_no_effect_is_given_up_quickly():
         assert not r.ok and "no effect" in r.message and sim.clock < 3
         r = eddy.execute(Drive(angular=0.8, angle=1.0))
         assert not r.ok and "heading did not change" in r.message
+
+
+def test_a_drive_that_stops_getting_anywhere_is_given_up():
+    """Reversing into a wall (no rear sensor): Eddy stops soon after progress stops."""
+    sim = SimAdapter(arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.tell("go back 5 meters")
+        assert not r.ok and "no longer getting anywhere" in r.message, r.message
+        assert sim.clock < 15       # 1.85 m at 0.2 m/s is about 9 s, plus the 2 s stall window
+
+
+def test_wander_works_on_a_car_like_robot():
+    sim = SimAdapter(car=True, arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.tell("wander for 60 seconds")
+        assert r.ok and "0 times" not in r.message, r.message
+        assert eddy.model.drive.kind == "car-like" and math.hypot(sim.x, sim.y) < 1.9
+
+
+def test_car_like_turn_with_no_room_says_why():
+    sim = SimAdapter(car=True, arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        sim.x = 1.65
+        r = eddy.tell("turn left 90 degrees")
+        assert not r.ok and "roll forward to turn" in r.message, r.message
+        sim.x = 0.0
+        r = eddy.tell("spin")
+        assert r.ok and "rolling forward 0.00" not in r.message, r.message
+
+
+def test_a_joint_target_past_its_limit_is_refused():
+    sim = SimAdapter()
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.tell("set joint shoulder to 500 degrees")
+        assert not r.ok and "can only go from" in r.message and abs(sim.joints["shoulder"]) < 1e-6
+        assert eddy.tell("set joint shoulder to 30 degrees").ok
+
+
+def test_several_commands_in_one_sentence():
+    assert [type(c).__name__ for c in intents.parse_all("turn left and move 50cm")] == ["Drive", "Drive"]
+    assert [type(c).__name__ for c in intents.parse_all("stop and go forward")] == ["Stop"]
+    assert [type(c).__name__ for c in intents.parse_all("say hello and goodbye")] == ["Say"]
+    assert [type(c).__name__ for c in intents.parse_all("reach 0.2, 0.1, 0.3")] == ["MoveTo"]
+    assert intents.parse_all("dance and sing") == []
+    sim = SimAdapter(arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.tell("turn left 90 degrees, then go forward 50 cm and turn right")
+        assert r.ok and abs(sim.y - 0.5) < 0.02 and abs(sim.heading) < 0.05, r.message
+        r = eddy.tell("go forward 5 meters and turn left")       # the wall stops the first step
+        assert "did not do the remaining 1" in r.message and abs(sim.heading) < 0.05, r.message
+
+
+def test_urdf_mimic_joints_are_found():
+    urdf = ('<robot name="r"><joint name="a" type="revolute"/>'
+            '<joint name="b" type="revolute"><mimic joint="a"/></joint></robot>')
+    assert urdf_mimics(urdf) == {"b": "a"}
+
+
+def test_classify_finds_point_clouds_and_published_poses():
+    topics = [("/lidar/points", ["sensor_msgs/msg/PointCloud2"]),
+              ("/slam/pose", ["geometry_msgs/msg/PoseWithCovarianceStamped"]),
+              ("/goal_pose", ["geometry_msgs/msg/PoseStamped"]),
+              ("/initialpose", ["geometry_msgs/msg/PoseWithCovarianceStamped"])]
+    pubs = {"/lidar/points": 1, "/slam/pose": 1, "/goal_pose": 1, "/initialpose": 0}
+    p = classify_graph(topics, {}, pubs)
+    assert p["cloud"] == "/lidar/points"
+    assert p["pose"] == ("/slam/pose", "geometry_msgs/msg/PoseWithCovarianceStamped")
+    assert "cmd_vel" not in p and "scan" not in p
+
+
+def test_cloud_front_range_looks_only_ahead_and_above_the_ground():
+    #        ahead     to the side   ground      behind     the robot itself
+    x = [3.0, 5.0,     2.0,          1.0,        -1.0,      0.1]
+    y = [0.1, -0.2,    1.5,          0.0,        0.0,       0.0]
+    z = [0.0, 0.3,     0.0,          -0.6,       0.0,       0.0]
+    assert abs(cloud_front_range(x, y, z) - math.hypot(3.0, 0.1)) < 1e-9
+    assert cloud_front_range([2.0], [1.5], [0.0]) is None
+    assert cloud_front_range([float("nan")], [0.0], [0.0]) is None
+
+
+def test_cloud_range_ignores_sloping_ground_and_sees_what_stands_on_it():
+    """A sensor 0.6 m up and tilted down sees the floor as a slope; a box on it is the obstacle."""
+    rng = np.random.default_rng(0)
+    gx, gy = rng.uniform(0.6, 12, 4000), rng.uniform(-4, 4, 4000)
+    gz = -0.6 - 0.08 * gx + rng.normal(0, 0.01, 4000)          # the ground, in the sensor's frame
+    assert cloud_front_range(gx, gy, gz) is None                # ground alone is not an obstacle
+    bx, by = np.full(40, 4.0), rng.uniform(-0.2, 0.2, 40)
+    bz = (-0.6 - 0.08 * 4.0) + rng.uniform(0.2, 0.5, 40)       # a box 4 m ahead, 20 to 50 cm tall
+    r = cloud_front_range(np.concatenate((gx, bx)), np.concatenate((gy, by)), np.concatenate((gz, bz)))
+    assert r is not None and abs(r - 4.0) < 0.1

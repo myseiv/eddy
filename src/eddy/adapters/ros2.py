@@ -28,6 +28,8 @@ TRAJECTORY = "trajectory_msgs/msg/JointTrajectory"      # joint targets for a co
 IMAGES = ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")
 STRING = "std_msgs/msg/String"                          # used for the robot's URDF
 FOLLOW = "control_msgs/action/FollowJointTrajectory"    # joint targets for a controller, as an action
+CLOUD = "sensor_msgs/msg/PointCloud2"                   # 3D lidar or depth camera points
+POSES = ("geometry_msgs/msg/PoseWithCovarianceStamped", "geometry_msgs/msg/PoseStamped")   # a position estimate
 
 
 def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
@@ -85,6 +87,22 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
         best = pick(by_type.get(type_name, []), preferred, counts, bool(pub_counts))
         if best:
             profile[key] = best
+    # A 3D point cloud can stand in for a laser scan, and a published pose for odometry.
+    clouds = [n for n in by_type.get(CLOUD, []) if not pub_counts or pub_counts.get(n, 0) > 0]
+    best = pick(clouds, "points", pub_counts, bool(pub_counts))
+    if best:
+        profile["cloud"] = best
+        # Up to three candidates: which one is the sensor's own output is decided from the
+        # messages themselves once they arrive (see Ros2Adapter._wire).
+        profile["clouds"] = [best] + sorted(n for n in clouds if n != best)[:2]
+    # Pose topics are also used to send goals and to reset a robot's position. Only one that
+    # something publishes, and that is not named like a command, counts as "where the robot is".
+    poses = {n: t for t in POSES for n in by_type.get(t, [])
+             if (not pub_counts or pub_counts.get(n, 0) > 0)
+             and not any(w in n.rsplit("/", 1)[-1].lower() for w in ("goal", "initial", "target", "set", "waypoint", "cmd"))}
+    best = pick(list(poses), "pose", pub_counts, bool(pub_counts))
+    if best:
+        profile["pose"] = (best, poses[best])
     # Trajectory topics a controller is actually listening on; ones named like a gripper are grippers.
     trajectories = sorted(n for n in by_type.get(TRAJECTORY, []) if not sub_counts or sub_counts.get(n, 0) > 0)
     grippers = [n for n in trajectories if any(w in n.lower() for w in ("gripper", "hand", "claw"))]
@@ -120,6 +138,17 @@ def urdf_limits(urdf: str) -> Dict[str, Tuple[float, float, str]]:
     return out
 
 
+def urdf_mimics(urdf: str) -> Dict[str, str]:
+    """Joints that only follow another joint (URDF <mimic>), as {follower: the joint it follows}.
+    Such joints cannot be commanded on their own: the joint they follow is the real one."""
+    out = {}
+    for el in ET.fromstring(urdf).findall("joint"):
+        mimic = el.find("mimic")
+        if mimic is not None and mimic.get("joint"):
+            out[el.get("name")] = mimic.get("joint")
+    return out
+
+
 def front_range(ranges: Sequence[float], angle_min: float, angle_increment: float,
                 range_min: float, range_max: float, half_width: float = 0.26) -> Optional[float]:
     """Nearest valid laser return within +/- half_width radians of straight ahead."""
@@ -138,6 +167,74 @@ def front_range(ranges: Sequence[float], angle_min: float, angle_increment: floa
     if best is None and seen:
         return range_max   # beams point ahead and nothing is within range
     return best            # None if the laser does not look ahead at all
+
+
+def cloud_xyz(msg):
+    """The x, y, z columns of a PointCloud2 message as three numpy arrays (sensor frame)."""
+    import numpy as np
+    fields = {f.name: f for f in msg.fields}
+    if not all(k in fields for k in "xyz") or not msg.point_step:
+        return None
+    kinds = {7: "f4", 8: "f8"}      # PointCloud2 codes for 32- and 64-bit floats
+    if any(fields[k].datatype not in kinds for k in "xyz"):
+        return None
+    order = ">" if msg.is_bigendian else "<"
+    dtype = np.dtype({"names": list("xyz"), "formats": [order + kinds[fields[k].datatype] for k in "xyz"],
+                      "offsets": [fields[k].offset for k in "xyz"], "itemsize": msg.point_step})
+    points = np.frombuffer(bytes(msg.data), dtype=dtype, count=len(msg.data) // msg.point_step)
+    return points["x"], points["y"], points["z"]
+
+
+def ground_plane(x, y, z, cell: float = 1.0):
+    """Fit the ground as a plane z = a*x + b*y + c from the lowest point in each cell of a grid
+    over the area in front of the sensor. Returns (a, b, c), or None if too little ground is seen.
+
+    This is what lets a 3D sensor of unknown height and tilt tell the floor from things on it.
+    """
+    import numpy as np
+    area = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & (x > 0.5) & (x < 15.0) & (np.abs(y) < 5.0)
+    if area.sum() < 50:
+        return None
+    gx, gy, gz = x[area], y[area], z[area]
+    # Lowest point per grid cell: sort by cell then height, and keep the first of each cell.
+    cells = np.floor(gx / cell).astype(np.int64) * 1000 + np.floor(gy / cell).astype(np.int64)
+    order = np.lexsort((gz, cells))
+    first = np.concatenate(([True], cells[order][1:] != cells[order][:-1]))
+    lx, ly, lz = gx[order][first], gy[order][first], gz[order][first]
+    keep = np.ones(len(lz), dtype=bool)
+    plane = None
+    for _ in range(4):
+        if keep.sum() < 6:
+            return None
+        A = np.column_stack((lx[keep], ly[keep], np.ones(keep.sum())))
+        plane = np.linalg.lstsq(A, lz[keep], rcond=None)[0]
+        # Cells whose lowest point is well above the fit hold only an object, not ground.
+        residual = lz - (plane[0] * lx + plane[1] * ly + plane[2])
+        keep = residual < 0.10
+    return tuple(float(v) for v in plane)
+
+
+def cloud_front_range(x, y, z, half_width: float = 0.4, below: float = 0.2, above: float = 1.5,
+                      nearest: float = 0.3, clearance: float = 0.15) -> Optional[float]:
+    """Distance to the nearest thing in a corridor straight ahead of a 3D sensor.
+
+    Assumes the usual ROS axes for the sensor (x forward, y left, z up). The corridor is
+    half_width to each side. Where the ground can be found, a "thing" is a point between
+    `clearance` and `above` over it; otherwise points more than `below` under the sensor are
+    taken to be the ground. Points closer than `nearest` are taken to be the robot itself.
+    None if nothing is there.
+    """
+    import numpy as np
+    x, y, z = (np.asarray(v, dtype=float) for v in (x, y, z))
+    d = np.hypot(x, y)
+    keep = np.isfinite(d) & np.isfinite(z) & (x > 0) & (np.abs(y) <= half_width) & (d >= nearest)
+    plane = ground_plane(x, y, z)
+    if plane is not None:
+        height = z - (plane[0] * x + plane[1] * y + plane[2])
+        keep &= (height >= clearance) & (height <= above)
+    else:
+        keep &= (z >= -below) & (z <= above)
+    return float(d[keep].min()) if keep.any() else None
 
 
 class Ros2Adapter(Adapter):
@@ -159,8 +256,14 @@ class Ros2Adapter(Adapter):
         self._lock = threading.Lock()             # guards _state and _urdf (written by the ROS thread)
         self._urdf: Optional[str] = None
         self._seen = set()                        # which sensors have delivered a first message
+        self._pose_counts = {"odom": 0, "pose": 0}   # messages from each source of position
+        self._pose_source: Optional[str] = None   # which of them is used, once decided
+        self._cloud_subs: Dict[str, object] = {}  # point cloud topic -> subscription
+        self._cloud_fields: Dict[str, int] = {}   # point cloud topic -> fields per point, once seen
+        self._cloud_choice: Optional[str] = None  # the point cloud used for range, once decided
         self._controllers: Dict[str, dict] = {}   # topic or action name -> {"pub" or "client", "joints", "gripper"}
         self._limits: Dict[str, Tuple[float, float, str]] = {}
+        self._mimics: Dict[str, str] = {}       # joints that only follow another joint
         self._we_started_rclpy = False
 
     # ---- connection ----------------------------------------------------------
@@ -228,9 +331,20 @@ class Ros2Adapter(Adapter):
         if "odom" in p:
             from nav_msgs.msg import Odometry
             node.create_subscription(Odometry, p["odom"], self._on_odom, qos_profile_sensor_data)
+        if "pose" in p:
+            from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+            topic, type_name = p["pose"]
+            node.create_subscription(PoseStamped if type_name.endswith("PoseStamped") else PoseWithCovarianceStamped,
+                                     topic, self._on_pose, qos_profile_sensor_data)
         if "scan" in p:
             from sensor_msgs.msg import LaserScan
             node.create_subscription(LaserScan, p["scan"], self._on_scan, qos_profile_sensor_data)
+        elif "cloud" in p:
+            # No laser scan: use the 3D point cloud to see what is ahead.
+            from sensor_msgs.msg import PointCloud2
+            for topic in p.get("clouds", [p["cloud"]]):
+                self._cloud_subs[topic] = node.create_subscription(
+                    PointCloud2, topic, lambda msg, topic=topic: self._on_cloud(msg, topic), qos_profile_sensor_data)
         if "joint_states" in p:
             from sensor_msgs.msg import JointState
             node.create_subscription(JointState, p["joint_states"], self._on_joints, qos_profile_sensor_data)
@@ -271,16 +385,35 @@ class Ros2Adapter(Adapter):
             with self._lock:
                 have_desc = "description" not in p or self._urdf is not None
                 have_joints = "joint_states" not in p or bool(self._state.joints)
-                have_sensors = all(k not in p or k in self._seen for k in ("odom", "scan"))
-            if have_desc and have_joints and have_sensors:
+                where = not ({"odom", "pose"} & set(p)) or bool({"odom", "pose"} & self._seen)
+                ahead = (not ({"scan", "cloud"} & set(p)) or "scan" in self._seen
+                         or (bool(self._cloud_subs) and len(self._cloud_fields) == len(self._cloud_subs)))
+            if have_desc and have_joints and where and ahead:
                 break
             time.sleep(0.05)
+        # A robot may publish both odometry and a pose. Use whichever is actually arriving
+        # (odometry if both are); mixing two sources would make the position jump.
+        with self._lock:
+            c = self._pose_counts
+            self._pose_source = "pose" if c["pose"] > c["odom"] else "odom"
+            # Several point clouds: keep the one whose points carry the most fields. A sensor's
+            # own output has per-point extras (ring, line, tag, time) that processed copies
+            # tend to drop, and processed copies may hold points that are not real surfaces.
+            if self._cloud_fields:
+                order = list(self._cloud_subs)
+                p["cloud"] = max(self._cloud_fields, key=lambda t: (self._cloud_fields[t], -order.index(t)))
+            self._cloud_choice = p.get("cloud")
+        for topic, sub in list(self._cloud_subs.items()):
+            if topic != self._cloud_choice:
+                node.destroy_subscription(sub)
+                del self._cloud_subs[topic]
         # No URDF on a topic: ask robot_state_publisher, which holds it as a parameter.
         if self._urdf is None:
             self._urdf = self._param("/robot_state_publisher", "robot_description")
         if self._urdf:
             try:
                 self._limits = urdf_limits(self._urdf)
+                self._mimics = urdf_mimics(self._urdf)
             except ET.ParseError:
                 self._urdf = None       # unreadable URDF: carry on without arm geometry
 
@@ -323,9 +456,17 @@ class Ros2Adapter(Adapter):
                 # Guess from the names: gripper-like joints go to a gripper controller,
                 # the remaining unclaimed joints to an arm controller.
                 # (wheels, which turn without limit, are never arm or gripper joints)
-                pool = [n for n in names if n not in commandable
+                # Joints that merely follow another joint (a gripper's linkage) are not
+                # commandable either: the joint they follow is, even if it is never reported.
+                def gripper_like(n: str) -> bool:
+                    return any(w in n.lower() for w in ("gripper", "finger", "jaw", "hand", "claw"))
+                pool = [n for n in names if n not in commandable and n not in self._mimics
                         and self._limits.get(n, (0.0, 0.0, "revolute"))[2] != "continuous"]
-                gripperish = [n for n in pool if any(w in n.lower() for w in ("gripper", "finger", "jaw", "hand", "claw"))]
+                gripperish = [n for n in pool if gripper_like(n)]
+                for follower, driver in self._mimics.items():
+                    if (gripper_like(follower) or gripper_like(driver)) and driver not in gripperish \
+                            and driver not in commandable and driver in self._limits:
+                        gripperish.append(driver)
                 c["joints"] = gripperish if c["gripper"] else [n for n in pool if n not in gripperish]
                 commandable.update(c["joints"])
         arm_joints = [j for c in self._controllers.values() if not c["gripper"] for j in c["joints"]]
@@ -345,15 +486,20 @@ class Ros2Adapter(Adapter):
                 chain = Chain.from_urdf(self._urdf, allowed=set(arm_joints))
             except Exception:
                 chain = None
-        sensors = [s for s, k in (("odometry", "odom"), ("range", "scan"), ("joint_state", "joint_states")) if k in p]
+        sensors = [s for s, keys in (("odometry", ("odom", "pose")), ("range", ("scan", "cloud")),
+                                     ("joint_state", ("joint_states",))) if any(k in p for k in keys)]
         if p.get("cameras"):
             sensors.append("camera")
         # Notes for `eddy info`: which nodes and topics were found and which ones Eddy chose.
         details = {"nodes": f"{len(nodes)} ({', '.join(nodes[:8])}{'...' if len(nodes) > 8 else ''})",
                    "topics": n_topics}
-        for key in ("cmd_vel", "odom", "scan", "joint_states"):
+        for key in ("cmd_vel", "odom", "pose", "scan", "joint_states"):
             if key in p:
                 details[key] = p[key][0] if isinstance(p[key], tuple) else p[key]
+        if "odom" in p and "pose" in p:
+            details["position from"] = p["pose"][0] if self._pose_source == "pose" else p["odom"]
+        if "cloud" in p and "scan" not in p:
+            details["range from"] = f"{p['cloud']} (3D points: assumes the sensor's x axis points forward; things 15 cm or more above the ground)"
         for topic, c in self._controllers.items():
             details[f"controller {topic}"] = ", ".join(c["joints"]) or "joints unknown"
         if p.get("cameras"):
@@ -369,15 +515,38 @@ class Ros2Adapter(Adapter):
     # These run on the ROS spin thread each time a message arrives. Each one just
     # stores the latest value under the lock.
 
-    def _on_odom(self, msg) -> None:
+    def _on_pose(self, msg) -> None:
+        """A published pose (with or without covariance): treated like odometry."""
+        self._on_odom(msg, source="pose")
+
+    def _on_cloud(self, msg, topic: str = "") -> None:
+        """3D points: keep only the distance to the nearest thing straight ahead."""
+        with self._lock:
+            self._cloud_fields.setdefault(topic, len(msg.fields))
+            if self._cloud_choice not in (None, topic):
+                return
+        columns = cloud_xyz(msg)
+        r = cloud_front_range(*columns) if columns is not None else None
+        with self._lock:
+            self._state.range_ahead = r
+            self._seen.add("cloud")
+
+    def _on_odom(self, msg, source: str = "odom") -> None:
         """Odometry: keep x, y and the heading."""
-        q = msg.pose.pose.orientation
+        pose = msg.pose.pose if hasattr(msg.pose, "pose") else msg.pose
+        with self._lock:
+            self._pose_counts[source] += 1
+            self._seen.add(source)
+            # Before the source is decided, odometry wins; afterwards only the chosen one counts.
+            if self._pose_source not in (None, source) or (self._pose_source is None and source == "pose"
+                                                           and self._pose_counts["odom"]):
+                return
+        q = pose.orientation
         # Heading (yaw) from the orientation quaternion.
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         with self._lock:
-            self._state.x, self._state.y = msg.pose.pose.position.x, msg.pose.pose.position.y
+            self._state.x, self._state.y = pose.position.x, pose.position.y
             self._state.heading, self._state.has_odometry = yaw, True
-            self._seen.add("odom")
 
     def _on_scan(self, msg) -> None:
         """Laser scan: keep only the distance to the nearest thing straight ahead."""

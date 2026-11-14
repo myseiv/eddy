@@ -141,8 +141,10 @@ class SimAdapter(Adapter):
             remaining -= dt
             self.clock += dt
             # Turn first (keeping the heading within -pi..pi), then move along the new heading.
-            # A car can only turn as fast as its speed allows (0.25 m tightest turning circle).
-            w = max(-abs(self.v) / 0.25, min(abs(self.v) / 0.25, self.w)) if self.car else self.w
+            # A car can only turn as fast as its speed allows (car=True: 0.25 m tightest turning
+            # circle; car=<number>: that radius in metres).
+            tightest = 0.25 if self.car is True else float(self.car or 0)     # turning circle radius, m
+            w = max(-abs(self.v) / tightest, min(abs(self.v) / tightest, self.w)) if self.car else self.w
             self.heading = math.atan2(math.sin(self.heading + w * dt), math.cos(self.heading + w * dt))
             nx = self.x + self.v * math.cos(self.heading) * dt
             ny = self.y + self.v * math.sin(self.heading) * dt

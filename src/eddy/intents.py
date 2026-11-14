@@ -142,3 +142,21 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             return Drive(linear=direction * v, distance=0.5)   # "go forward" with no amount: half a metre
     # "go" or "move" with no direction and no amount is too vague to act on.
     return None
+
+
+def parse_all(text: str, **speeds) -> list:
+    """Return the commands in a sentence, in order: usually one, several for
+    "turn left and go forward 50 cm". An empty list means nothing was understood.
+
+    A sentence is only split when every piece is a command on its own. A sentence that
+    contains "stop" is just Stop, and "say ..." is never split.
+    """
+    whole = parse(text, **speeds)
+    if isinstance(whole, (Stop, Say)):
+        return [whole]
+    pieces = [p for p in re.split(r"(?i)\s*(?:;|,|\band then\b|\bthen\b|\band\b)\s*", text) if p.strip()]
+    if len(pieces) > 1:
+        commands = [parse(p, **speeds) for p in pieces]
+        if all(c is not None for c in commands):
+            return commands
+    return [whole] if whole is not None else []

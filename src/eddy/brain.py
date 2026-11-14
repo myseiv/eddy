@@ -41,6 +41,7 @@ class Result:
 
 CAR = "car-like"    # DriveSpec.kind of a robot found unable to turn on the spot
 CREEP = 0.12        # m/s: forward speed used to turn such a robot
+NO_ROOM = "this robot has to roll forward to turn, and something is too close in front of it"
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
 
 
@@ -87,10 +88,22 @@ class Eddy:
 
     def tell(self, text: str) -> Result:
         """Carry out a sentence."""
-        command = intents.parse(text)
-        if command is None:
+        commands = intents.parse_all(text)
+        if not commands:
             return self._finish(Result(False, f"I don't know how to \"{text.strip()}\"."))
-        return self.execute(command)
+        if len(commands) == 1:
+            return self.execute(commands[0])
+        # Several commands in one sentence ("turn left and go forward 50 cm"): run them in
+        # order, and do not carry on past one that failed or was interrupted.
+        results = []
+        for command in commands:
+            results.append(self.execute(command))
+            if not results[-1].ok or results[-1].message.startswith(("Interrupted", "Stopped early")):
+                break
+        message = " Then: ".join(r.message for r in results)
+        if len(results) < len(commands):
+            message += f" I did not do the remaining {len(commands) - len(results)} step(s)."
+        return Result(results[-1].ok, message, results[-1].command)
 
     def sign(self, landmarks) -> Optional[Result]:
         """Feed one camera frame's hand landmarks. Acts when a sign has been held steadily."""
@@ -179,7 +192,7 @@ class Eddy:
         if isinstance(command, MoveTo):
             return self._reach(command, mine)
         if isinstance(command, SetJoints):
-            return self._joints(command.positions, mine)
+            return self._joints(command.positions, mine, strict=True)
         if isinstance(command, Home):
             # Home is "every arm joint to zero". Use the arm chain's joints if the geometry
             # is known, otherwise every joint the robot has.
@@ -189,6 +202,12 @@ class Eddy:
             return self._joints({n: 0.0 for n in names}, mine, label="Home")
         if isinstance(command, Gripper):
             self.adapter.set_gripper(command.opening)
+            # Grippers rarely report their position, so give the move the second it is
+            # allowed before saying it is done (a newer command cuts the wait short).
+            waited = 0.0
+            while waited < 1.0 and self._epoch == mine:
+                self.adapter.wait(self.safety.tick)
+                waited += self.safety.tick
             return "Gripper open." if command.opening >= 0.5 else "Gripper closed."
         raise Unsupported(f"unknown command {type(command).__name__}")
 
@@ -231,15 +250,19 @@ class Eddy:
         if arc:
             lin = self._limits(CREEP, 0.0)[0]
         if self._blocked(lin):
-            raise Refused("something is too close in front of me")
+            raise Refused(NO_ROOM if arc else "something is too close in front of me")
 
         start = self.adapter.state()
         # With odometry we measure progress and stop on arrival; without it we just time the move.
         odometry = start.has_odometry and goal is not None
         deadline = budget * 2 + 2 if odometry else budget   # with odometry, time is only a backstop
+        if arc and odometry:
+            deadline = goal / 0.1 + 4                       # turning while rolling is slower
         tick = self.safety.tick
         last_heading, turned, travelled, elapsed, why = start.heading, 0.0, 0.0, 0.0, "done"
-        stall_at = STALL            # when to check that the robot has started to respond
+        last_x, last_y, path = start.x, start.y, 0.0    # distance along the path actually driven
+        small = 0.005 if cmd.distance is not None else math.radians(2)   # less than this is "no progress"
+        mark_time, mark_progress = 0.0, 0.0     # progress at the start of the current stall window
         try:
             # Control loop: every tick, check for a newer command and for obstacles, measure
             # progress, and re-send the velocity (robots with a command timeout need that).
@@ -257,20 +280,28 @@ class Eddy:
                     # Add up the turn in small steps so turns past 180 degrees count correctly.
                     turned += abs(_wrap(s.heading - last_heading))
                     last_heading = s.heading
-                    left = goal - (travelled if cmd.distance is not None else turned)
-                    if left <= 0.004:
+                    path += math.hypot(s.x - last_x, s.y - last_y)
+                    last_x, last_y = s.x, s.y
+                    progress = travelled if cmd.distance is not None else turned
+                    if goal - progress <= 0.004:
                         break
-                    # Nothing at all has happened for a while: the command is not having an effect.
-                    if elapsed >= stall_at and (travelled if cmd.distance is not None else turned) < \
-                            (0.005 if cmd.distance is not None else math.radians(2)):
-                        if spot_turn and not arc and cmd.angle is not None and not self._blocked(CREEP):
-                            # Perhaps it steers like a car: try again, rolling forward while turning.
-                            arc, lin = True, self._limits(CREEP, 0.0)[0]
-                            stall_at = elapsed + STALL
-                            deadline += STALL
-                            continue
-                        why = "stalled"
-                        break
+                    left = goal - progress
+                    # Every STALL seconds, check that the robot got somewhere in that time.
+                    if elapsed - mark_time >= STALL:
+                        if progress - mark_progress < small:
+                            if progress < small and spot_turn and not arc and cmd.angle is not None:
+                                # A turn on the spot did nothing at all. Perhaps the robot steers
+                                # like a car: try again, rolling forward while turning.
+                                if self._blocked(CREEP):
+                                    why = "no room"
+                                    break
+                                arc, lin = True, self._limits(CREEP, 0.0)[0]
+                                mark_time = elapsed
+                                deadline = elapsed + goal / 0.1 + 4     # such turns are slower
+                                continue
+                            why = "stalled"
+                            break
+                        mark_time, mark_progress = elapsed, progress
                     if arc and self.model.drive.kind != CAR and turned >= math.radians(5):
                         self.model.drive.kind = CAR     # it worked: remember for the next turn
                     ease = 0.15 if cmd.distance is not None else 0.35   # slow down near the goal
@@ -296,14 +327,24 @@ class Eddy:
                 turned = abs(_wrap(end.heading - start.heading))
             what = (f"turned {math.degrees(turned):.0f} degrees" if spot_turn
                     else f"moved {moved:.2f} m")
+            if not odometry:
+                path = moved        # a timed move is not tracked tick by tick
             if arc and self.model.drive.kind == CAR:
-                what += f", rolling forward {moved:.2f} m because this robot cannot turn on the spot"
+                what += f", rolling forward {path:.2f} m because this robot cannot turn on the spot"
         else:
             what = f"drove for {elapsed:.1f} s"
         if why == "blocked":
             self.speaker.say("Something is in my way.")
             return f"Stopped early, something is in the way ({what})."
+        asked = None if goal is None else (f"{goal:.2f} m" if cmd.distance is not None
+                                           else f"{math.degrees(goal):.0f} degrees")
+        if why == "no room":
+            raise Refused(NO_ROOM)
         if why == "stalled":
+            if mark_progress >= small:
+                # It was moving and then stopped getting anywhere: most likely pushing on something.
+                raise Refused(f"I stopped because the robot was no longer getting anywhere: I only {what} "
+                              f"of the {asked} asked for. Something may be blocking it.")
             if spot_turn:
                 raise Refused("the turn had no effect: the heading did not change, on the spot or while "
                               "rolling forward. Either the wheels are not turning the robot, or its "
@@ -311,7 +352,6 @@ class Eddy:
             raise Refused("the command had no effect: the robot's odometry shows no movement. "
                           "Is it free to move, and is this the right velocity topic?")
         if why == "timeout":
-            asked = f"{goal:.2f} m" if cmd.distance is not None else f"{math.degrees(goal):.0f} degrees"
             raise Refused(f"I ran out of time: I only {what} of the {asked} asked for. "
                           "Is the robot free to move, and is its odometry registering the motion?")
         if why == "interrupted":
@@ -327,26 +367,39 @@ class Eddy:
         duration = min(cmd.duration, 600.0)                 # never wander more than ten minutes
         lin, ang = self._limits(0.2, 0.8)
         caution = max(self.safety.min_range * 2, 0.5)       # start turning well before the hard limit
-        elapsed, turns = 0.0, 0
-        turning_until = -1.0                                # time at which the current turn ends
+        elapsed, turns, tick = 0.0, 0, self.safety.tick
+        turning, turn_done, turn_time = False, 0.0, 0.0     # the turn in progress, if any
+        away = math.pi * 0.6                                # turn about 110 degrees away
+        last_heading = self.adapter.state().heading
         try:
             while elapsed < duration:
                 if self._epoch != mine:
                     return f"Interrupted after wandering {elapsed:.0f} s."
-                ahead = self.adapter.state().range_ahead
-                if elapsed < turning_until:
-                    # In the middle of a turn: keep turning.
-                    self.adapter.set_velocity(0.0, ang)
-                elif ahead is not None and ahead < caution:
-                    # Something is close: start a new turn.
-                    turns += 1
-                    turning_until = elapsed + (math.pi * 0.6) / ang    # turn about 110 degrees away
-                    self.adapter.set_velocity(0.0, ang)
+                s = self.adapter.state()
+                car = self.model.drive.kind == CAR
+                if turning:
+                    turn_done += abs(_wrap(s.heading - last_heading))
+                    if (turn_done >= away) if s.has_odometry else (turn_time >= away / ang):
+                        turning, turns = False, turns + 1
+                    elif s.has_odometry and turn_time >= STALL and turn_done < math.radians(2):
+                        if car:
+                            raise Refused(f"I got stuck after wandering {elapsed:.0f} s: I could not turn "
+                                          "away from what is in front of me")
+                        # Turning on the spot did nothing: treat the robot as car-like from now on.
+                        self.model.drive.kind, turn_time = CAR, 0.0
+                    elif turn_time > away / 0.1 + 4:
+                        raise Refused(f"I got stuck after wandering {elapsed:.0f} s: the turn never finished")
+                    else:
+                        # A car-like robot backs away while steering; others turn on the spot.
+                        self.adapter.set_velocity(-self._limits(CREEP, 0.0)[0] if car else 0.0, ang)
+                        turn_time += tick
+                elif s.range_ahead is not None and s.range_ahead < caution:
+                    turning, turn_done, turn_time = True, 0.0, 0.0      # something is close: turn away
                 else:
-                    # Path is clear: go forward.
-                    self.adapter.set_velocity(lin, 0.0)
-                self.adapter.wait(self.safety.tick)
-                elapsed += self.safety.tick
+                    self.adapter.set_velocity(lin, 0.0)                 # path is clear: go forward
+                last_heading = s.heading
+                self.adapter.wait(tick)
+                elapsed += tick
         finally:
             self.adapter.stop()
         return f"Wandered for {elapsed:.0f} s and turned away from obstacles {turns} times."
@@ -369,7 +422,7 @@ class Eddy:
         self._joints(result.as_dict(chain), mine)
         return f"Reached x {cmd.x:.2f}, y {cmd.y:.2f}, z {cmd.z:.2f}."
 
-    def _joints(self, positions: dict, mine: int, label: str = "Joints") -> str:
+    def _joints(self, positions: dict, mine: int, label: str = "Joints", strict: bool = False) -> str:
         """Move named joints to target positions and wait until they get there."""
         if not self.model.joints:
             raise Unsupported("this robot has no joints")
@@ -380,6 +433,12 @@ class Eddy:
             if spec is None:
                 known = ", ".join(j.name for j in self.model.joints)
                 raise Refused(f"there is no single joint called {name} (this robot has: {known})")
+            if strict and not spec.lower - 1e-6 <= float(value) <= spec.upper + 1e-6:
+                # A person asked for a position this joint cannot take: say so instead of
+                # quietly going somewhere else.
+                unit, k = ("m", 1.0) if spec.kind == "prismatic" else ("degrees", 180 / math.pi)
+                raise Refused(f"{spec.name} can only go from {spec.lower * k:.3g} to {spec.upper * k:.3g} {unit}, "
+                              f"and {float(value) * k:.3g} was asked for")
             targets[spec.name] = max(spec.lower, min(spec.upper, float(value)))
         # Give the move enough time that the joint with furthest to go stays under 1 rad/s.
         now = self.adapter.state().joints
