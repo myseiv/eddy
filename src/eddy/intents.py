@@ -9,7 +9,7 @@ import math
 import re
 from typing import Optional
 
-from .model import Drive, Gripper, Home, MoveBy, MoveTo, Report, Say, SetJoints, Stop, Wander
+from .model import Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Report, Say, SetJoints, Stop, Wander
 
 # Number words and the value each stands for, so "two meters" works as well as "2 meters".
 _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -24,7 +24,7 @@ _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
 VOCABULARY = (
     "eddy eddie stop halt freeze go drive move forward ahead straight back backward backwards reverse "
     "turn rotate spin left right around clockwise slow slowly fast quickly "
-    "open close gripper hand grab release home reach arm up down raise lower the wander explore patrol status report say hello "
+    "open close gripper hand grab release home reach arm up down raise lower take off land fly climb descend the wander explore patrol status report say hello "
     "zero one two three four five six seven eight nine ten twenty thirty forty fifty sixty ninety hundred half "
     "meter meters centimeter centimeters foot feet inch inches second seconds minute minutes degree degrees "
     "for please"
@@ -115,6 +115,16 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             return MoveTo(x, y, z)
         return None
 
+    # Flying: "take off", "take off to 2 meters", "land", "go up 50 cm", "descend 1 meter".
+    if re.search(r"\b(take off|takeoff|lift off|liftoff|launch)\b", t):
+        return TakeOff(_amount(t, _LENGTH) or 1.0)
+    if re.search(r"\b(land|touch down|touchdown)\b", t):
+        return Land()
+    m = re.search(r"\b(climb|ascend|descend)\b|\b(?:go|fly|move|come)\s+(up|down|higher|lower)\b", t)
+    if m:
+        word = m.group(1) or m.group(2)
+        return Climb((-1.0 if word in ("descend", "down", "lower") else 1.0) * (_amount(t, _LENGTH) or 0.5))
+
     if re.search(r"\b(wander|explore|roam|look around|patrol)\b", t):
         return Wander(_amount(t, _TIME) or 10.0)
 
@@ -143,7 +153,7 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             return Drive(angular=w, angle=2 * math.pi)                 # "spin": one full turn
         return None
 
-    if straight or re.search(r"\b(go|drive|move|come|advance|roll)\b", t):
+    if straight or re.search(r"\b(go|drive|move|come|advance|roll|fly)\b", t):
         direction = -1.0 if re.search(r"\b(back|backward|backwards|reverse)\b", t) else 1.0
         distance, duration = _amount(t, _LENGTH), _amount(t, _TIME)
         if distance is not None:

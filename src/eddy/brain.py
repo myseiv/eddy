@@ -14,7 +14,7 @@ from typing import Callable, List, Optional
 
 from . import gestures, intents
 from .adapters.base import Adapter
-from .model import (Drive, Gripper, Home, MoveBy, MoveTo, Refused, Report, RobotModel, Say, SetJoints, Stop,
+from .model import (Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Refused, Report, RobotModel, Say, SetJoints, Stop,
                     Unsupported, Wander)
 from .senses.speak import Speaker
 
@@ -42,6 +42,8 @@ class Result:
 CAR = "car-like"    # DriveSpec.kind of a robot found unable to turn on the spot
 CREEP = 0.12        # m/s: forward speed used to turn such a robot
 NO_ROOM = "this robot has to roll forward to turn, and something is too close in front of it"
+FLYING = "flying"   # DriveSpec.kind of a robot found to change height on command
+CLIMB = 0.3         # m/s: climb and descent speed
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
 
 
@@ -177,6 +179,8 @@ class Eddy:
         parts = [f"I am Eddy, running {m.name}. I can: {', '.join(m.capabilities()) or 'nothing yet'}."]
         if s.has_odometry:
             parts.append(f"I am at x {s.x:.2f}, y {s.y:.2f}, facing {math.degrees(s.heading):.0f} degrees.")
+            if self.model.drive is not None and self.model.drive.kind == FLYING:
+                parts.append(f"My height is {s.z:.2f} metres.")
         if s.range_ahead is not None:
             parts.append(f"The nearest thing ahead is {s.range_ahead:.2f} metres away.")
         return " ".join(parts)
@@ -189,6 +193,12 @@ class Eddy:
             return self._drive(command, mine)
         if isinstance(command, Wander):
             return self._wander(command, mine)
+        if isinstance(command, TakeOff):
+            return self._climb(abs(command.height), mine, "Took off")
+        if isinstance(command, Climb):
+            return self._climb(command.dz, mine, "Climbed" if command.dz > 0 else "Descended")
+        if isinstance(command, Land):
+            return self._land(mine)
         if isinstance(command, MoveTo):
             return self._reach(command, mine)
         if isinstance(command, MoveBy):
@@ -235,7 +245,7 @@ class Eddy:
             return False        # turning on the spot
         return s.range_ahead is not None and s.range_ahead < self.safety.min_range
 
-    def _drive(self, cmd: Drive, mine: int) -> str:
+    def _drive(self, cmd: Drive, mine: int, trim: bool = True) -> str:
         """Drive a distance, turn an angle, or drive for a time."""
         if self.model.drive is None:
             raise Unsupported("this robot cannot drive")
@@ -373,6 +383,18 @@ class Eddy:
         # Work out what actually happened, for the report. Where the odometry is slow, wait for
         # one more update so the report is the final position, not one from before the stop.
         end = self.adapter.state()
+        if odometry:
+            # Let the robot come to rest first (a drone or a heavy base coasts on after the
+            # stop), so the report is where it ended up, not where it was when told to stop.
+            waited, still = 0.0, 0.0
+            while waited < 2.0 and still < 0.3:
+                self.adapter.wait(tick)
+                waited += tick
+                now = self.adapter.state()
+                moving = (math.hypot(now.x - end.x, now.y - end.y) > 0.002
+                          or abs(_wrap(now.heading - end.heading)) > math.radians(0.3))
+                still = 0.0 if moving else still + tick
+                end = now
         if end.odom_age is not None and odometry:
             waited = 0.0
             while waited < 1.5 and self.adapter.state().odom_age >= max(end.odom_age, 0.25) + waited - 0.05:
@@ -433,7 +455,96 @@ class Eddy:
                           "Is the robot free to move, and is its odometry registering the motion?")
         if why == "interrupted":
             return f"Interrupted ({what})."
+        # A robot that is slow to respond (a drone, a heavy base, slow odometry) ends a turn on
+        # the spot past the angle asked for. Turn back the difference once, slowly.
+        over = turned - goal if (trim and cmd.angle is not None and odometry and not arc) else 0.0
+        if over > math.radians(4) and self._epoch == mine:
+            before = self.adapter.state().heading
+            try:
+                self._drive(Drive(angular=-math.copysign(min(abs(ang), 0.3), ang), angle=over), mine, trim=False)
+            except Refused:
+                pass            # the correction could not be made: report what the turn really was
+            turned -= abs(_wrap(self.adapter.state().heading - before))
+            what = f"turned {math.degrees(turned):.0f} degrees"
         return f"Done: {what}."
+
+    def _climb(self, dz: float, mine: int, label: str) -> str:
+        """Go straight up or down by dz metres, measured by the robot's own height reading.
+
+        Nothing on a robot says whether it flies, so Eddy finds out the way it finds out that
+        a robot cannot turn on the spot: it tries, and if the height does not change it says so.
+        """
+        if self.model.drive is None:
+            raise Unsupported("this robot cannot move")
+        start = self.adapter.state()
+        if not start.has_odometry:
+            raise Refused("I will not fly without a position reading that tells me my height")
+        goal = abs(dz)
+        speed = min(CLIMB, self.model.drive.max_linear) * self.safety.speed_scale * (1 if dz > 0 else -1)
+        deadline = min(goal / abs(speed) * 2 + 4, 2 * self.safety.max_drive_seconds)
+        elapsed, moved, mark_time, mark_moved, why = 0.0, 0.0, 0.0, 0.0, "timeout"
+        try:
+            while elapsed < deadline:
+                if self._epoch != mine:
+                    why = "interrupted"
+                    break
+                moved = abs(self.adapter.state().z - start.z)
+                if goal - moved <= 0.01:
+                    why = "done"
+                    break
+                if elapsed - mark_time >= STALL:
+                    if moved - mark_moved < 0.02:
+                        why = "stalled"
+                        break
+                    mark_time, mark_moved = elapsed, moved
+                scale = max(0.25, min(1.0, (goal - moved) / 0.3))      # slow down near the height asked for
+                self.adapter.set_velocity(0.0, 0.0, speed * scale)
+                self.adapter.wait(self.safety.tick)
+                elapsed += self.safety.tick
+        finally:
+            self.adapter.stop()         # zero velocity: a flying robot hovers
+        end = self.adapter.state()
+        moved = abs(end.z - start.z)
+        if moved >= 0.05:
+            self.model.drive.kind = FLYING      # it changed height on command: remember that it flies
+        if why == "stalled" and moved < 0.02:
+            if dz < 0:
+                return "I am not going any lower: I seem to be on the ground already."
+            raise Refused("commanding the robot upwards changed nothing. It does not seem to be a flying robot "
+                          "(or its motors are not enabled).")
+        if why in ("stalled", "timeout"):
+            raise Refused(f"I only changed height by {moved:.2f} m of the {goal:.2f} m asked for; my height is now {end.z:.2f} m")
+        if why == "interrupted":
+            return f"Interrupted (height now {end.z:.2f} m)."
+        return f"{label} {moved:.2f} m. My height is now {end.z:.2f} m."
+
+    def _land(self, mine: int) -> str:
+        """Descend until the height stops falling, then stop."""
+        if self.model.drive is None:
+            raise Unsupported("this robot cannot move")
+        start = self.adapter.state()
+        if not start.has_odometry:
+            raise Refused("I will not fly without a position reading that tells me my height")
+        speed = -min(CLIMB, self.model.drive.max_linear) * self.safety.speed_scale
+        elapsed, mark_time, mark_z = 0.0, 0.0, start.z
+        try:
+            while elapsed < 2 * self.safety.max_drive_seconds:
+                if self._epoch != mine:
+                    return f"Interrupted (height now {self.adapter.state().z:.2f} m)."
+                z = self.adapter.state().z
+                if elapsed - mark_time >= STALL / 2:
+                    if mark_z - z < 0.02:
+                        break                    # not going down any more: on the ground
+                    mark_time, mark_z = elapsed, z
+                self.adapter.set_velocity(0.0, 0.0, speed)
+                self.adapter.wait(self.safety.tick)
+                elapsed += self.safety.tick
+        finally:
+            self.adapter.stop()
+        end = self.adapter.state()
+        if start.z - end.z < 0.02:
+            return "I am already on the ground."
+        return f"Landed: came down {start.z - end.z:.2f} m."
 
     def _wander(self, cmd: Wander, mine: int) -> str:
         """Simple autonomy: go forward, and turn away whenever something is close ahead."""

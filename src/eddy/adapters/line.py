@@ -129,7 +129,9 @@ class LineAdapter(Adapter):
 
     # Each command below is one line of the protocol shown at the top of this file.
 
-    def set_velocity(self, linear: float, angular: float) -> None:
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
+        if vertical:
+            raise Unsupported("robots on the line protocol cannot be flown")
         self._ask(f"V {linear:.4f} {angular:.4f}")
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:

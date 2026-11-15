@@ -1,7 +1,21 @@
 #!/usr/bin/env bash
 # Inside the eddy-sims image: start Gazebo (no screen) on a test world and bridge its topics
 # to ROS 2.  Usage: gz_up.sh diff_drive|ackermann_steering plain|namespaced|steering
+#         gz_up.sh multicopter_velocity_control drone
 source /opt/ros/humble/setup.bash
+if [ "$2" = drone ]; then
+  # Gazebo's stock quadcopter world, exactly as shipped (the X3 model is fetched from Gazebo's
+  # model library the first time). It is flown by velocity commands, including up and down.
+  ign gazebo -s -r "/usr/share/ignition/ignition-gazebo6/worlds/$1.sdf" >/tmp/gz.log 2>&1 &
+  ros2 run ros_gz_bridge parameter_bridge "/X3/gazebo/command/twist@geometry_msgs/msg/Twist]ignition.msgs.Twist" \
+    "/model/x3/odometry@nav_msgs/msg/Odometry[ignition.msgs.Odometry" >/tmp/bridge.log 2>&1 &
+  for i in $(seq 90); do
+    timeout 3 ign topic -e -t /model/x3/odometry -n 1 >/dev/null 2>&1 && break
+    sleep 1
+  done
+  echo "gazebo up ($1, drone)"
+  exit 0
+fi
 python3 /eddy/tests/sims/make_world.py "$1" > /tmp/world.sdf
 ign gazebo -s -r --headless-rendering /tmp/world.sdf >/tmp/gz.log 2>&1 &
 blue=/model/vehicle_blue

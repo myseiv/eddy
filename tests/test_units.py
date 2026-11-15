@@ -534,3 +534,33 @@ def test_scan_rotation_measures_a_turn_from_two_scans():
         got = scan_rotation(room_scan(0.5, -0.3, 0.3), room_scan(0.5, -0.3, 0.3 + turn), inc)
         assert abs(got - turn) < math.radians(1.5), (turn, got)
     assert scan_rotation([1.0] * 10, [1.0] * 12, inc) == 0.0
+
+
+def test_flying_sentences_and_a_simulated_drone():
+    from eddy.model import Climb, Land, TakeOff
+    assert intents.parse("take off") == TakeOff(1.0)
+    assert intents.parse("take off to 2 meters") == TakeOff(2.0)
+    assert intents.parse("land") == Land()
+    assert intents.parse("go up 50 cm") == Climb(0.5)
+    assert intents.parse("descend 1 meter") == Climb(-1.0)
+    assert intents.parse("fly forward 2 meters") == Drive(linear=0.2, distance=2.0)
+    assert isinstance(intents.parse("move the arm up 5 cm"), type(intents.parse("raise the arm")))
+    sim = SimAdapter(arm=False, flies=True)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        assert not eddy.tell("drive forward 1 meter").ok              # on the ground: nothing happens
+        r = eddy.tell("take off")
+        assert r.ok and abs(sim.z - 1.0) < 0.03 and eddy.model.drive.kind == "flying", r.message
+        assert eddy.tell("go up 50 cm").ok and abs(sim.z - 1.5) < 0.03
+        assert eddy.tell("fly forward 1 meter").ok and abs(sim.x - 1.0) < 0.02
+        assert "height" in eddy.tell("status").message
+        r = eddy.tell("land")
+        assert r.ok and sim.z == 0.0 and "Landed" in r.message, r.message
+        assert "already on the ground" in eddy.tell("land").message
+
+
+def test_a_ground_robot_told_to_take_off_says_it_does_not_fly():
+    sim = SimAdapter(arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        r = eddy.tell("take off")
+        assert not r.ok and "does not seem to be a flying robot" in r.message and sim.clock < 4
+        assert eddy.model.drive.kind != "flying"

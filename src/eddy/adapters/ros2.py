@@ -655,7 +655,7 @@ class Ros2Adapter(Adapter):
         # Heading (yaw) from the orientation quaternion.
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         with self._lock:
-            self._state.x, self._state.y = pose.position.x, pose.position.y
+            self._state.x, self._state.y, self._state.z = pose.position.x, pose.position.y, pose.position.z
             self._state.heading, self._state.has_odometry = yaw, True
             self._odom_time = time.monotonic()
 
@@ -700,9 +700,9 @@ class Ros2Adapter(Adapter):
             age = None if self._odom_time is None else time.monotonic() - self._odom_time
             return RobotState(s.x, s.y, s.heading, dict(s.joints), s.range_ahead, s.gripper, s.has_odometry,
                               range_behind=s.range_behind, range_max=s.range_max, odom_age=age,
-                              scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
+                              z=s.z, scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
 
-    def set_velocity(self, linear: float, angular: float) -> None:
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
         """Publish one velocity command, in whichever Twist flavour the robot uses."""
         if "cmd_vel" not in self.profile:
             raise Unsupported("no velocity command topic found on this robot")
@@ -727,6 +727,7 @@ class Ros2Adapter(Adapter):
         from geometry_msgs.msg import Twist, TwistStamped
         twist = Twist()
         twist.linear.x, twist.angular.z = float(linear), float(angular)
+        twist.linear.z = float(vertical)        # climb rate; ground robots ignore it
         if self._twist_stamped:
             msg = TwistStamped()
             msg.header.stamp = self.node.get_clock().now().to_msg()

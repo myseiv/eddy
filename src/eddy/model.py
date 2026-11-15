@@ -112,6 +112,7 @@ class RobotState:
     range_ahead: Optional[float] = None        # metres to the nearest thing in front
     gripper: Optional[float] = None            # 0 closed .. 1 open
     has_odometry: bool = False                 # False means x, y, heading cannot be trusted
+    z: float = 0.0                             # height, metres, in the odometry frame (flying robots)
     range_behind: Optional[float] = None       # metres to the nearest thing behind, if the sensor looks there
     range_max: Optional[float] = None          # the range sensor's limit: a reading this large means "nothing seen"
     axis_ahead: Optional[float] = None         # metres to whatever is exactly straight ahead (a narrow beam)
@@ -172,6 +173,24 @@ class Home:
 class Gripper:
     """Open or close the gripper."""
     opening: float  # 0 closed .. 1 open
+
+
+@dataclass
+class Climb:
+    """Go straight up (positive) or down (negative) by this many metres. Flying robots only."""
+    dz: float
+
+
+@dataclass
+class TakeOff:
+    """Rise to this height above where the robot is now, and hover."""
+    height: float = 1.0
+
+
+@dataclass
+class Land:
+    """Descend until the robot stops going down."""
+    pass
 
 
 @dataclass

@@ -118,8 +118,8 @@ All but the first need Docker. `tests/ros2/run.sh` runs Eddy against a mock robo
 ROS 2 Jazzy, and `tests/peers/run.sh` runs two robots on separate machines talking to each
 other. `run_hiwonder.sh` uses stand-ins for two real robots Eddy has been tried on.
 `tests/sims/run.sh` uses public simulators that were not written for Eddy (a Franka Panda arm
-on stock ros2_control controllers, and Gazebo's stock differential-drive and car-steered
-vehicles) and compares every result with the simulator's true pose; it builds a 4 GB image
+on stock ros2_control controllers, Gazebo's stock differential-drive and car-steered
+vehicles, and its stock quadcopter) and compares every result with the simulator's true pose; it builds a 4 GB image
 the first time and takes about ten minutes.
 
 See [docs/PLAN.md](docs/PLAN.md) for the design, what has been verified, and what comes next.

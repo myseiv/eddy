@@ -21,8 +21,11 @@ class SimAdapter(Adapter):
     kind = "sim"
 
     def __init__(self, name: str = "sim-rover", room: float = 2.0, realtime: bool = False,
-                 arm: bool = True, drive: bool = True, car: bool = False):
+                 arm: bool = True, drive: bool = True, car: bool = False,
+                 flies: bool = False):
         self.name = name
+        self.flies = flies          # True: a flying robot, which obeys climb commands
+        self.z = self.vz = 0.0      # height and commanded climb rate
         self.car = car              # True: steers like a car, so it cannot turn without rolling
         self.room = room            # walls at +/- room metres
         self.radius = 0.15          # the rover's own radius, metres
@@ -77,11 +80,13 @@ class SimAdapter(Adapter):
     # The three command calls only record what was asked for; _advance_locked() does the moving.
     # Without the matching ability they fall through to the base class, which raises Unsupported.
 
-    def set_velocity(self, linear: float, angular: float) -> None:
-        """Remember the commanded speeds."""
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
+        """Remember the commanded speeds. (A robot that does not fly ignores the climb rate,
+        as a real ground robot's base would.)"""
         if not self.has_drive:
             return super().set_velocity(linear, angular)
         self.v, self.w = float(linear), float(angular)
+        self.vz = float(vertical) if self.flies else 0.0
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
         """Remember the joint targets. (The simulated joints move at a fixed speed, so
@@ -116,7 +121,7 @@ class SimAdapter(Adapter):
         """The simulated robot's current pose, joints, range reading and gripper."""
         return RobotState(self.x, self.y, self.heading, dict(self.joints),
                           self._range_ahead() if self.has_drive else None,
-                          self.gripper if self.has_arm else None, has_odometry=self.has_drive)
+                          self.gripper if self.has_arm else None, has_odometry=self.has_drive, z=self.z)
 
     def wait(self, seconds: float) -> None:
         """Let simulated time pass."""
@@ -149,6 +154,9 @@ class SimAdapter(Adapter):
             nx = self.x + self.v * math.cos(self.heading) * dt
             ny = self.y + self.v * math.sin(self.heading) * dt
             limit = self.room - self.radius
+            self.z = max(0.0, self.z + self.vz * dt)        # the ground is at height zero
+            if self.flies and self.z <= 0.0:
+                nx, ny = self.x, self.y                     # a flying robot on the ground does not slide
             if abs(nx) > limit or abs(ny) > limit:
                 self.bumped = True          # hit a wall: the wheels spin but it does not move
             else:
