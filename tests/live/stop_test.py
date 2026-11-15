@@ -27,7 +27,7 @@ from eddy.brain import Eddy
 from eddy.model import Drive
 from eddy.senses.speak import Speaker
 
-CAMERA = 1          # the MacBook camera is 1 on this Mac (0 is the iPhone); set back to 0 after these tests
+CAMERA = 0      # the camera index; on the owner's MacBook the built-in camera was 1 (0 was the iPhone)
 DRIVE_M, SPEED = 1.6, 0.2       # an 8 second drive: long enough to react
 WAIT = 4.0          # seconds to read the instruction before the drive starts
 DRY = "dry" in sys.argv[1:]

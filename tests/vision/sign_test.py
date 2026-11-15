@@ -41,7 +41,7 @@ SCRIPT = [
 ]
 HOLD = 5.0      # seconds each one is watched
 READY = 3.0     # seconds to get the hand into place first
-CAMERA = 1      # the MacBook camera is 1 on this Mac (0 is the iPhone); set back to 0 after these tests
+CAMERA = 0      # the camera index; on the owner's MacBook the built-in camera was 1 (0 was the iPhone)
 
 
 def show(cv2, frame, landmarks, sign, lines):
