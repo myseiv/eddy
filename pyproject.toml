@@ -13,7 +13,7 @@ dependencies = ["numpy>=1.21"]
 [project.optional-dependencies]
 serial = ["pyserial>=3.5"]
 vision = ["opencv-python-headless>=4.5", "mediapipe>=0.10"]
-voice = ["vosk>=0.3.45", "sounddevice>=0.4"]
+voice = ["vosk>=0.3.42", "sounddevice>=0.4"]
 dev = ["pytest>=7"]
 
 [project.scripts]

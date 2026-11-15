@@ -80,16 +80,16 @@ def run(verbose: bool = True) -> int:
     check("gripper closes and opens", closed == 0.0 and sim.gripper == 1.0)
 
     # -- hand signs
-    # Each call to sign() is one camera frame. A sign acts on the fifth frame in a row.
+    # Each call to sign() is one camera frame. A stop sign acts on the fifth frame in a row, a moving sign on the tenth.
     sim, eddy = fresh()
-    acted = [eddy.sign(gestures.fake_hand(["index"])) for _ in range(5)]
+    acted = [eddy.sign(gestures.fake_hand(["index"])) for _ in range(10)]
     check("hand sign 'point' drives forward", acted[-1] is not None and acted[-1].ok and sim.x > 0.08,
           f"x={sim.x:.2f}")
-    check("a sign must be held, not glimpsed", all(a is None for a in acted[:4]))
+    check("a sign must be held, not glimpsed", all(a is None for a in acted[:9]))
     acted = [eddy.sign(gestures.fake_hand(["index", "middle", "ring", "pinky"], "left")) for _ in range(5)]
     check("hand sign 'open palm' stops", acted[-1] is not None and "Stopped" in acted[-1].message)
     before = sim.heading
-    for _ in range(5):
+    for _ in range(10):
         eddy.sign(gestures.fake_hand([], "right"))
     check("hand sign 'thumb right' turns right", sim.heading < before - 0.2)
 

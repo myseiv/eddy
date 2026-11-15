@@ -199,10 +199,27 @@ def test_hand_signs_on_real_photos():
 
 
 def test_gesture_filter_needs_a_steady_sign_and_repeats_a_held_one():
-    """A sign counts only after 3 steady frames, repeats every 4 frames while held, and a change resets the count."""
+    """A moving sign counts after twice the hold (6 frames here), repeats every 4 while held, and a change resets the count."""
     f = gestures.GestureFilter(hold_frames=3, repeat_frames=4)
-    seen = [f.update(g) for g in ["point", "fist", "point", "point", "point", "point", "point", "point", "point", None]]
-    assert seen == [None, None, None, None, "point", None, None, None, "point", None]
+    seen = [f.update(g) for g in ["point", "fist", "point"] + ["point"] * 9 + [None]]
+    assert seen == [None] * 7 + ["point"] + [None] * 3 + ["point"] + [None]
+
+
+def test_stop_signs_act_after_the_short_hold():
+    """Stopping must stay quick: a fist or open palm counts after the short hold, a pointing hand needs longer."""
+    for sign in ("fist", "open_palm"):
+        f = gestures.GestureFilter(hold_frames=3)
+        assert [f.update(sign) for _ in range(3)] == [None, None, sign]
+    f = gestures.GestureFilter(hold_frames=3)
+    assert "point" not in [f.update("point") for _ in range(5)]
+
+
+def test_a_thumb_halfway_between_sideways_and_up_is_no_sign():
+    """The wavering thumb that flipped between left, right and up in the live test now names nothing."""
+    lm = gestures.fake_hand([], "right")
+    lm[3] = [lm[2][0] + 0.05, lm[2][1] - 0.05]
+    lm[4] = [lm[2][0] + 0.1, lm[2][1] - 0.1]        # sticking out, exactly diagonal
+    assert gestures.classify(lm) is None
 
 
 def test_bad_landmarks_are_ignored():
@@ -588,3 +605,21 @@ def test_moves_too_long_to_finish_are_refused_before_starting():
             r = eddy.tell(s)
             assert not r.ok and "at a time" in r.message and sim.clock < 0.5, (s, r.message)
         assert abs(sim.x) < 1e-6 and abs(sim.heading) < 1e-6
+
+
+def test_a_partly_heard_command_is_not_acted_on():
+    from eddy.senses.listen import heard_command
+    assert heard_command("eddy drive forward one meter") == ("drive forward one meter", False)
+    assert heard_command("eddy [unk] drive forward") == ("drive forward", True)        # "don't" was not caught
+    assert heard_command("[unk] eddy turn left") == ("turn left", False)               # chatter before the name is fine
+    assert heard_command("drive forward one meter") == (None, False)                   # not addressed to Eddy
+    assert heard_command("eddy [unk] stop [unk]") == ("stop", False)                   # stop is always safe
+    assert heard_command("eddy") == (None, False) and heard_command("eddy [unk]") == (None, False)
+    assert heard_command("go forward", None) == ("go forward", False)
+
+
+def test_spoken_negations_number_words_and_run_together_commands():
+    for s in ("don't drive forward", "go forward or turn left", "go forward five", "turn left go forward one meter"):
+        assert intents.parse_all(s) == [], s
+    for w in ("don't", "not", "never", "or", "and", "cancel"):
+        assert w in intents.VOCABULARY.split()

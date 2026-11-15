@@ -116,15 +116,20 @@ def cmd_run(args) -> int:
 
     # --voice: listen on the microphone and act on sentences addressed to Eddy.
     if args.voice:
-        from .senses.listen import Listener, strip_wake_word
+        from .senses.listen import Listener, heard_command
         listener = Listener(args.voice_model)
         wake = None if args.no_wake_word else "eddy"
 
         def hear():
             """Thread: every phrase heard, minus the wake word, becomes a command."""
             for phrase in listener.phrases():
-                sentence = strip_wake_word(phrase, wake)
-                if sentence:
+                sentence, unclear = heard_command(phrase, wake)
+                if sentence and unclear:
+                    # Part of it was not caught. Acting on the rest could do the opposite of
+                    # what was said, so say so and do nothing.
+                    print(f"[heard only part] {sentence}  -> not acted on", flush=True)
+                    eddy.speaker.say("I did not catch all of that.")
+                elif sentence:
                     print(f"[heard] {sentence}", flush=True)
                     eddy.tell(sentence)
         background("voice", hear)
@@ -184,10 +189,13 @@ def cmd_run(args) -> int:
 def cmd_hear(args) -> int:
     """`eddy hear file.wav`: recognise the speech in a recording and carry it out
     (tests listening without a microphone)."""
-    from .senses.listen import Listener
-    text = Listener(args.voice_model).transcribe(args.wav)
+    from .senses.listen import Listener, heard_command
+    text, unclear = heard_command(Listener(args.voice_model).transcribe(args.wav), None)
     print(f"[heard] {text or '(nothing)'}")
     if not text:
+        return 1
+    if unclear:
+        print("  part of that was not caught, so it was not acted on")
         return 1
     with _eddy(args) as eddy:
         result = eddy.tell(text)

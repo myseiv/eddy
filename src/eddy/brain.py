@@ -590,6 +590,7 @@ class Eddy:
         caution = max(self.safety.min_range * 2, 0.5)       # start turning well before the hard limit
         elapsed, turns, tick = 0.0, 0, self.safety.tick
         turning, turn_done, turn_time = False, 0.0, 0.0     # the turn in progress, if any
+        backing = True                                      # a car-like robot starts its turn by backing away
         away = math.pi * 0.6                                # turn about 110 degrees away
         last_heading = self.adapter.state().heading
         try:
@@ -612,14 +613,21 @@ class Eddy:
                         self.model.drive.kind, turn_time = CAR, 0.0
                     elif turn_time > away / 0.03 + 6:
                         raise Refused(f"I got stuck after wandering {elapsed:.0f} s: the turn never finished")
-                    elif car and s.range_behind is not None and s.range_behind < self.safety.min_range:
-                        raise Refused(f"I got stuck after wandering {elapsed:.0f} s: no room behind me to back away and turn")
+                    elif car and backing and s.range_behind is not None and s.range_behind < self.safety.min_range:
+                        # No room left behind: carry on with the turn rolling forwards instead
+                        # (a three-point turn), unless that way is blocked too.
+                        if s.range_ahead is not None and s.range_ahead < self.safety.min_range:
+                            raise Refused(f"I got stuck after wandering {elapsed:.0f} s: no room in front or behind to turn")
+                        backing = False
+                    elif car and not backing and s.range_ahead is not None and s.range_ahead < self.safety.min_range:
+                        backing = True
                     else:
                         # A car-like robot backs away while steering; others turn on the spot.
-                        self.adapter.set_velocity(-self._limits(CREEP, 0.0)[0] if car else 0.0, ang)
+                        creep = self._limits(CREEP, 0.0)[0]
+                        self.adapter.set_velocity((-creep if backing else creep) if car else 0.0, ang)
                         turn_time += tick
                 elif s.range_ahead is not None and s.range_ahead < caution:
-                    turning, turn_done, turn_time = True, 0.0, 0.0      # something is close: turn away
+                    turning, turn_done, turn_time, backing = True, 0.0, 0.0, True   # something is close: turn away
                 else:
                     self.adapter.set_velocity(lin, 0.0)                 # path is clear: go forward
                 last_heading = s.heading

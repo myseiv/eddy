@@ -71,9 +71,9 @@ class Listener:
             while True:
                 # AcceptWaveform returns True when the speaker has paused, i.e. a phrase is finished.
                 if recognizer.AcceptWaveform(audio.get()):
-                    text = _clean(json.loads(recognizer.Result()).get("text", ""))
-                    if text:
-                        yield text
+                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                    if _clean(text):
+                        yield text      # unknown sounds stay marked "[unk]"; see heard_command()
 
     def transcribe(self, wav_path: str) -> str:
         """Recognise speech in a 16-bit mono WAV file (for testing without a microphone)."""
@@ -91,12 +91,37 @@ class Listener:
                 if recognizer.AcceptWaveform(data):
                     heard.append(json.loads(recognizer.Result()).get("text", ""))
             heard.append(json.loads(recognizer.FinalResult()).get("text", ""))     # whatever was left at the end
-        return _clean(" ".join(heard))
+        return " ".join(" ".join(heard).split())    # unknown sounds stay marked "[unk]"
 
 
 def _clean(text: str) -> str:
     """Drop the recogniser's marker for sounds that were not one of our words."""
     return " ".join(w for w in text.split() if w != "[unk]")
+
+
+UNKNOWN = "[unk]"       # the recogniser's marker for a sound that was not one of Eddy's words
+
+
+def heard_command(phrase: str, wake_word: Optional[str] = "eddy"):
+    """Decide what to do with a phrase from the recogniser. Returns (sentence, unclear).
+
+    sentence is None when the phrase was not addressed to Eddy. unclear is True when part of
+    the command was a sound Eddy does not know: the words it did catch might be the opposite
+    of what was said ("don't ... drive forward"), so such a command must not be carried out.
+    A sentence containing "stop" is never unclear: stopping is always safe.
+    """
+    words = phrase.lower().split()
+    if wake_word:
+        variants = {wake_word, "eddie", "eddy", "edi", "eddi", "eddies"} if wake_word == "eddy" else {wake_word}
+        hits = [i for i, w in enumerate(words) if w in variants]
+        if not hits:
+            return None, False
+        words = words[hits[0] + 1:]
+    if not _clean(" ".join(words)):
+        return None, False
+    if any(w in ("stop", "halt", "freeze") for w in words):
+        return "stop", False
+    return _clean(" ".join(words)), UNKNOWN in words
 
 
 def strip_wake_word(text: str, wake_word: Optional[str] = "eddy") -> Optional[str]:

@@ -6,3 +6,7 @@ build/
 dist/
 .pytest_cache/
 models/
+
+voice_results.json
+wake_results.json
+sign_results.json

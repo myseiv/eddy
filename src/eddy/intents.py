@@ -27,7 +27,11 @@ VOCABULARY = (
     "open close gripper hand grab release home reach arm up down raise lower take off land fly climb descend the wander explore patrol status report say hello "
     "zero one two three four five six seven eight nine ten twenty thirty forty fifty sixty ninety hundred half "
     "meter meters centimeter centimeters foot feet inch inches second seconds minute minutes degree degrees "
-    "for please"
+    "for please "
+    # Words that change or cancel the meaning of a command. The recogniser must be able to
+    # hear them, or "don't drive forward" would arrive as "drive forward".
+    "don't do not never no or unless if and then cancel wait "
+    "joint set to"
 )
 # Regex matching one number: digits ("1.5", "-2") or a number word. Longest words first, so
 # "forty-five" is not cut short at "forty".
@@ -172,8 +176,11 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
         distance, duration = _amount(t, _LENGTH), _amount(t, _TIME)
         if re.search(r"(?<![\w.])-\d", t):
             return None             # a negative amount is ambiguous: say the direction instead
-        if distance is None and duration is None and re.search(r"\d", t):
+        if distance is None and duration is None and (re.search(r"\d", t) or re.search(
+                r"\b(one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|ninety|hundred)\b", t)):
             return None             # "go forward 5": five what? Not guessed.
+        if turn and re.search(r"\b(turn|rotate|spin)\b", t):
+            return None             # "turn left go forward": two commands run together; not guessed
         if distance is not None:
             return Drive(linear=direction * v, distance=distance)
         if duration is not None:

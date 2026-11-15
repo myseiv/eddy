@@ -31,6 +31,16 @@ DEFAULT_ACTIONS = {
 }
 
 
+# A thumb must point clearly sideways (or clearly up or down) to count: this many times further
+# along one axis than the other, about 40 degrees from the axis (1.5 was too strict in the live test: a thumb held 33 degrees off
+# horizontal was dropped half the time). A wavering thumb in between
+# flipped between left, right and up in the live test, and a wrong turn is worse than none.
+DIAGONAL = 1.2
+
+# Signs that stop the robot act after a short hold; signs that move it must be held longer.
+QUICK = ("open_palm", "fist")
+
+
 def _dist(a, b) -> float:
     """Distance between two landmarks in the image plane (z is ignored)."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -71,21 +81,26 @@ def classify(lm: Sequence[Sequence[float]]) -> Optional[str]:
             return "fist"
         # Which way the thumb points: from its base joint to its tip.
         dx, dy = lm[4][0] - lm[2][0], lm[4][1] - lm[2][1]
-        if abs(dx) > abs(dy):
+        if abs(dx) > DIAGONAL * abs(dy):
             # Named from the robot's point of view: its camera looks forward, so the right of
             # the image is the robot's right. "Thumb that way" means "turn that way".
             return "thumb_right" if dx > 0 else "thumb_left"
-        return "thumb_up" if dy < 0 else "thumb_down"       # y grows downward in an image
+        if abs(dy) > DIAGONAL * abs(dx):
+            return "thumb_up" if dy < 0 else "thumb_down"   # y grows downward in an image
+        return None     # a thumb halfway between sideways and up is no sign: do nothing rather than guess
     return None     # any other combination of fingers is not a sign Eddy knows
 
 
 class GestureFilter:
     """Only report a sign after it has been seen for several frames in a row, and only once."""
 
-    def __init__(self, hold_frames: int = 5, repeat_frames: int = 15):
-        """hold_frames: frames a sign must last before it counts.
+    def __init__(self, hold_frames: int = 5, repeat_frames: int = 15, move_hold_frames: Optional[int] = None):
+        """hold_frames: frames a stop sign must last before it counts (short, so stopping is quick).
+        move_hold_frames: frames any other sign must last (default twice hold_frames), so a hand that
+        only passes through a pointing shape does not start the robot.
         repeat_frames: frames between repeats while it is still being held."""
         self.hold_frames, self.repeat_frames = hold_frames, repeat_frames
+        self.move_hold_frames = move_hold_frames if move_hold_frames is not None else 2 * hold_frames
         self.current: Optional[str] = None      # the sign seen in the latest frame
         self.count = 0                          # how many frames in a row it has been seen
 
@@ -97,10 +112,11 @@ class GestureFilter:
             self.count += 1
         if gesture is None:
             return None
-        if self.count == self.hold_frames:
+        hold = self.hold_frames if gesture in QUICK else self.move_hold_frames
+        if self.count == hold:
             return gesture
         # A held sign repeats, so "keep pointing" keeps the robot moving.
-        if self.count > self.hold_frames and (self.count - self.hold_frames) % self.repeat_frames == 0:
+        if self.count > hold and (self.count - hold) % self.repeat_frames == 0:
             return gesture
         return None
 
