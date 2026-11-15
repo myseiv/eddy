@@ -59,33 +59,6 @@ ends by running `eddy doctor` and `eddy selftest` on the Pi. To start Eddy at bo
 ./scripts/install.sh --service "run -r ros2 --speak --peers --key my-secret"
 ```
 
-## A robot with no internet
-
-The core (driving, arm, typed commands, ROS 2) needs only numpy: copy the folder over and set
-`PYTHONPATH` to include `src`. The camera and microphone need extra Python packages and two
-model files, which normally come from the internet. For a robot with no wifi, build a bundle on
-a computer that has internet, for the robot's own CPU and Python:
-
-```bash
-uname -m && python3 --version        # run on the robot (inside its container, if it has one)
-```
-
-```bash
-./scripts/make_offline_bundle.sh --arch aarch64 --python 3.10 --all
-```
-
-Use `--vision` (hand signs), `--voice`, `--serial` or `--all`; with none of them, and in a terminal,
-it shows a menu. Copy `dist/eddy-offline-<arch>-py<version>.tar.gz` to the robot (USB stick or
-`scp`), then on the robot:
-
-```bash
-tar xzf eddy-offline-aarch64-py3.10.tar.gz && cd eddy-offline-aarch64-py3.10 && ./install_offline.sh
-```
-
-Add `--no-venv` inside a ROS container with no `python3-venv`; the robot's own numpy is kept.
-System libraries (`libgl1`, `libportaudio2` and so on) cannot be bundled: the installer names any
-that are missing. The installer refuses a bundle built for a different CPU or Python.
-
 ## Attach it to a robot
 
 | Robot | Command | What Eddy needs from it |
