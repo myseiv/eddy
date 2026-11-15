@@ -81,7 +81,11 @@ class RobotModel:
             if len(candidates) == 1:
                 return candidates[0]
             if candidates:
-                return None         # ambiguous: do not guess which joint was meant
+                # Several match ("joint1" on an arm that also has "finger_joint1"): take the
+                # one on the arm itself if that settles it, otherwise do not guess.
+                arm = set(getattr(self.chain, "joint_names", []) or [])
+                on_arm = [j for j in candidates if j.name in arm]
+                return on_arm[0] if len(on_arm) == 1 else None
         return None
 
     def summary(self) -> str:
@@ -108,6 +112,12 @@ class RobotState:
     range_ahead: Optional[float] = None        # metres to the nearest thing in front
     gripper: Optional[float] = None            # 0 closed .. 1 open
     has_odometry: bool = False                 # False means x, y, heading cannot be trusted
+    range_behind: Optional[float] = None       # metres to the nearest thing behind, if the sensor looks there
+    range_max: Optional[float] = None          # the range sensor's limit: a reading this large means "nothing seen"
+    axis_ahead: Optional[float] = None         # metres to whatever is exactly straight ahead (a narrow beam)
+    axis_behind: Optional[float] = None        # the same, exactly straight behind
+    scan_turn: Optional[float] = None          # radians turned so far as seen by a 360-degree laser (None: unknown)
+    odom_age: Optional[float] = None           # seconds since the position was last updated (None: always fresh)
 
 
 # ---- Commands -----------------------------------------------------------------
@@ -136,6 +146,14 @@ class MoveTo:
     x: float
     y: float
     z: float
+
+
+@dataclass
+class MoveBy:
+    """Move the arm's tool by this much from where it is now (metres, robot base frame)."""
+    dx: float = 0.0
+    dy: float = 0.0
+    dz: float = 0.0
 
 
 @dataclass

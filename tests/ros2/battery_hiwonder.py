@@ -68,7 +68,8 @@ check("two commands in one sentence", r.ok and "Then:" in r.message and abs(turn
 r, moved, turned, b = tell("drive forward 6 meters")
 check("stops for the wall on the laser, without touching it", "in the way" in r.message and not b["bumped"])
 r, moved, turned, b = tell("go back 6 meters")
-check("gives up soon after backing into a wall", not r.ok and "no longer getting anywhere" in r.message, r.message)
+check("stops for the wall behind it without touching it (the laser sees all round)",
+      "in the way" in r.message and not b["bumped"], r.message)
 r, moved, turned, b = tell("drive forward 1 meter")
 r, moved, turned, b = tell("wander for 25 seconds")
 check("wanders and turns away from walls", r.ok and "0 times" not in r.message, r.message)

@@ -9,7 +9,7 @@ import math
 import re
 from typing import Optional
 
-from .model import Drive, Gripper, Home, MoveTo, Report, Say, SetJoints, Stop, Wander
+from .model import Drive, Gripper, Home, MoveBy, MoveTo, Report, Say, SetJoints, Stop, Wander
 
 # Number words and the value each stands for, so "two meters" works as well as "2 meters".
 _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -24,7 +24,7 @@ _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
 VOCABULARY = (
     "eddy eddie stop halt freeze go drive move forward ahead straight back backward backwards reverse "
     "turn rotate spin left right around clockwise slow slowly fast quickly "
-    "open close gripper hand grab release home reach arm the wander explore patrol status report say hello "
+    "open close gripper hand grab release home reach arm up down raise lower the wander explore patrol status report say hello "
     "zero one two three four five six seven eight nine ten twenty thirty forty fifty sixty ninety hundred half "
     "meter meters centimeter centimeters foot feet inch inches second seconds minute minutes degree degrees "
     "for please"
@@ -83,6 +83,18 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     if m:
         value = float(m.group(3))
         return SetJoints({m.group(1) or m.group(2): math.radians(value) if m.group(4) else value})
+
+    # The arm, relative to where it is: "move the arm up 5 cm", "raise the arm", "arm left 10 cm".
+    # With no amount it moves 5 cm.
+    if not re.search(r"\b(open|close)\b", t):
+        m = (re.search(r"\b(?:arm|hand|tool|gripper)\b.*\b(up|down|forward|forwards|back|backward|backwards|left|right)\b", t)
+             or re.search(r"\b(raise|lift|lower)\b.*\b(?:arm|hand|tool|gripper)\b", t))
+        if m:
+            step = _amount(t, _LENGTH) or 0.05
+            axis = {"up": (0, 0, 1), "raise": (0, 0, 1), "lift": (0, 0, 1), "down": (0, 0, -1), "lower": (0, 0, -1),
+                    "forward": (1, 0, 0), "forwards": (1, 0, 0), "back": (-1, 0, 0), "backward": (-1, 0, 0),
+                    "backwards": (-1, 0, 0), "left": (0, 1, 0), "right": (0, -1, 0)}[m.group(1)]
+            return MoveBy(*(step * a for a in axis))
 
     # Gripper: "open the gripper", "let go", "grab", ...
     if re.search(r"\b(open)\b.*\b(gripper|hand|claw)\b|\b(release|let go|drop)\b", t):

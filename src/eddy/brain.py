@@ -14,7 +14,7 @@ from typing import Callable, List, Optional
 
 from . import gestures, intents
 from .adapters.base import Adapter
-from .model import (Drive, Gripper, Home, MoveTo, Refused, Report, RobotModel, Say, SetJoints, Stop,
+from .model import (Drive, Gripper, Home, MoveBy, MoveTo, Refused, Report, RobotModel, Say, SetJoints, Stop,
                     Unsupported, Wander)
 from .senses.speak import Speaker
 
@@ -191,6 +191,14 @@ class Eddy:
             return self._wander(command, mine)
         if isinstance(command, MoveTo):
             return self._reach(command, mine)
+        if isinstance(command, MoveBy):
+            # Relative move: work out where the tool is now, then reach to that plus the step.
+            chain = self.model.chain
+            if chain is None:
+                raise Unsupported("I don't know this robot's arm geometry, so I can't move the arm that way")
+            now = self.adapter.state().joints
+            x, y, z = chain.position([now.get(n, 0.0) for n in chain.joint_names])
+            return self._reach(MoveTo(float(x) + command.dx, float(y) + command.dy, float(z) + command.dz), mine)
         if isinstance(command, SetJoints):
             return self._joints(command.positions, mine, strict=True)
         if isinstance(command, Home):
@@ -219,10 +227,13 @@ class Eddy:
 
     def _blocked(self, linear: float) -> bool:
         """True if we are about to drive forward into something the range sensor sees."""
-        if linear <= 0:
-            return False        # reversing or turning on the spot: the forward sensor says nothing
-        ahead = self.adapter.state().range_ahead
-        return ahead is not None and ahead < self.safety.min_range
+        s = self.adapter.state()
+        if linear < 0:
+            # Reversing: only a sensor that also looks behind (a 360-degree laser) can say.
+            return s.range_behind is not None and s.range_behind < self.safety.min_range
+        if linear == 0:
+            return False        # turning on the spot
+        return s.range_ahead is not None and s.range_ahead < self.safety.min_range
 
     def _drive(self, cmd: Drive, mine: int) -> str:
         """Drive a distance, turn an angle, or drive for a time."""
@@ -250,19 +261,33 @@ class Eddy:
         if arc:
             lin = self._limits(CREEP, 0.0)[0]
         if self._blocked(lin):
-            raise Refused(NO_ROOM if arc else "something is too close in front of me")
+            raise Refused(NO_ROOM if arc else
+                          "something is too close " + ("behind me" if lin < 0 else "in front of me"))
 
         start = self.adapter.state()
         # With odometry we measure progress and stop on arrival; without it we just time the move.
         odometry = start.has_odometry and goal is not None
         deadline = budget * 2 + 2 if odometry else budget   # with odometry, time is only a backstop
         if arc and odometry:
-            deadline = goal / 0.1 + 4                       # turning while rolling is slower
+            deadline = min(goal / 0.03 + 6, 2 * self.safety.max_drive_seconds)   # turning while rolling is slower
         tick = self.safety.tick
         last_heading, turned, travelled, elapsed, why = start.heading, 0.0, 0.0, 0.0, "done"
         last_x, last_y, path = start.x, start.y, 0.0    # distance along the path actually driven
         small = 0.005 if cmd.distance is not None else math.radians(2)   # less than this is "no progress"
         mark_time, mark_progress = 0.0, 0.0     # progress at the start of the current stall window
+        # For a straight drive, the laser reading in the direction of travel at the start of
+        # the window: if the odometry says we moved but that distance did not shrink, the
+        # wheels are slipping (odometry from wheel rotation cannot tell).
+        straight = ang == 0 and lin != 0
+
+        def seen(state):
+            r = state.axis_ahead if lin > 0 else state.axis_behind
+            nothing = r is None or (state.range_max is not None and r >= 0.98 * state.range_max)
+            return None if nothing else r
+        mark_range = seen(start) if straight else None
+        sent = 0.0                              # the speed last commanded along the goal (m/s or rad/s)
+        rate, rate_from = 0.0, None             # the speed the odometry actually shows, and (progress, time) it was last seen at
+        mark_scan = start.scan_turn             # the laser's own count of the turn, at the window start
         try:
             # Control loop: every tick, check for a newer command and for obstacles, measure
             # progress, and re-send the velocity (robots with a command timeout need that).
@@ -283,9 +308,19 @@ class Eddy:
                     path += math.hypot(s.x - last_x, s.y - last_y)
                     last_x, last_y = s.x, s.y
                     progress = travelled if cmd.distance is not None else turned
-                    if goal - progress <= 0.004:
+                    # Slow odometry (some robots update it about once a second): between updates,
+                    # assume the robot kept doing what it was last told, so it stops on time.
+                    # The speed used is the one the odometry itself has shown (never more than
+                    # was commanded): a car steering at its limit turns slower than asked.
+                    if s.odom_age is not None:
+                        at = elapsed - s.odom_age
+                        if rate_from is None:
+                            rate_from = (progress, at)
+                        elif progress != rate_from[0] and at - rate_from[1] > 1e-3:
+                            rate, rate_from = min(sent, (progress - rate_from[0]) / (at - rate_from[1])), (progress, at)
+                    left = goal - progress - rate * min(s.odom_age or 0.0, 2.0)
+                    if left <= 0.004:
                         break
-                    left = goal - progress
                     # Every STALL seconds, check that the robot got somewhere in that time.
                     if elapsed - mark_time >= STALL:
                         if progress - mark_progress < small:
@@ -297,16 +332,34 @@ class Eddy:
                                     break
                                 arc, lin = True, self._limits(CREEP, 0.0)[0]
                                 mark_time = elapsed
-                                deadline = elapsed + goal / 0.1 + 4     # such turns are slower
+                                deadline = elapsed + min(goal / 0.03 + 6, 2 * self.safety.max_drive_seconds)
                                 continue
                             why = "stalled"
                             break
+                        if cmd.angle is not None and not arc and mark_scan is not None and s.scan_turn is not None:
+                            # The same idea for turns: the odometry says we turned, but the laser
+                            # scan has not rotated to match. The body is jammed against something.
+                            claimed = progress - mark_progress
+                            if claimed >= math.radians(20) and abs(s.scan_turn - mark_scan) < 0.3 * claimed:
+                                why = "jammed"
+                                break
+                        mark_scan = s.scan_turn
+                        if straight:
+                            now_range = seen(s)
+                            if (mark_range is not None and now_range is not None and progress - mark_progress >= 0.15
+                                    and mark_range - now_range < 0.3 * (progress - mark_progress)):
+                                why = "slipping"
+                                break
+                            mark_range = now_range
                         mark_time, mark_progress = elapsed, progress
                     if arc and self.model.drive.kind != CAR and turned >= math.radians(5):
                         self.model.drive.kind = CAR     # it worked: remember for the next turn
                     ease = 0.15 if cmd.distance is not None else 0.35   # slow down near the goal
                     scale = max(0.2, min(1.0, left / ease))
-                self.adapter.set_velocity(lin * scale, ang * scale)
+                # Slowing down near the goal: a robot turning while it rolls keeps its rolling speed
+                # and eases only the steering, or it would crawl and never finish.
+                self.adapter.set_velocity(lin if arc else lin * scale, ang * scale)
+                sent = abs(lin if cmd.distance is not None else ang) * scale
                 step = min(tick, deadline - elapsed)
                 self.adapter.wait(step)
                 elapsed += step
@@ -317,8 +370,15 @@ class Eddy:
                     why = "timeout"
         finally:
             self.adapter.stop()     # whatever happened, never leave the robot moving
-        # Work out what actually happened, for the report.
+        # Work out what actually happened, for the report. Where the odometry is slow, wait for
+        # one more update so the report is the final position, not one from before the stop.
         end = self.adapter.state()
+        if end.odom_age is not None and odometry:
+            waited = 0.0
+            while waited < 1.5 and self.adapter.state().odom_age >= max(end.odom_age, 0.25) + waited - 0.05:
+                self.adapter.wait(0.05)
+                waited += 0.05
+            end = self.adapter.state()
         if start.has_odometry:
             moved = math.hypot(end.x - start.x, end.y - start.y)
             if odometry:
@@ -340,6 +400,23 @@ class Eddy:
                                            else f"{math.degrees(goal):.0f} degrees")
         if why == "no room":
             raise Refused(NO_ROOM)
+        # A finished turn is checked once more against the laser, over the whole turn: a robot
+        # that jammed part of the way round would otherwise be reported as having arrived.
+        seen_turn = None
+        # (Only for turns on the spot: while the robot also travels, the scan changes for that
+        # reason too and cannot be read as a pure rotation.)
+        if cmd.angle is not None and not arc and start.scan_turn is not None and end.scan_turn is not None:
+            seen_turn = abs(end.scan_turn - start.scan_turn)
+            if why == "done" and turned >= math.radians(20) and seen_turn < 0.7 * turned:
+                why = "jammed"
+        if why == "jammed":
+            really = f" (about {math.degrees(seen_turn):.0f} degrees by the laser)" if seen_turn is not None else ""
+            raise Refused(f"I stopped: my odometry says I {what}, but the laser shows the robot did not turn "
+                          f"that far{really}. It is probably jammed against something; back away before turning.")
+        if why == "slipping":
+            where = "ahead" if lin > 0 else "behind"
+            raise Refused(f"I stopped: my odometry says I {what}, but the laser shows the distance {where} "
+                          "has not changed. The wheels are probably slipping against something.")
         if why == "stalled":
             if mark_progress >= small:
                 # It was moving and then stopped getting anywhere: most likely pushing on something.
@@ -387,8 +464,10 @@ class Eddy:
                                           "away from what is in front of me")
                         # Turning on the spot did nothing: treat the robot as car-like from now on.
                         self.model.drive.kind, turn_time = CAR, 0.0
-                    elif turn_time > away / 0.1 + 4:
+                    elif turn_time > away / 0.03 + 6:
                         raise Refused(f"I got stuck after wandering {elapsed:.0f} s: the turn never finished")
+                    elif car and s.range_behind is not None and s.range_behind < self.safety.min_range:
+                        raise Refused(f"I got stuck after wandering {elapsed:.0f} s: no room behind me to back away and turn")
                     else:
                         # A car-like robot backs away while steering; others turn on the spot.
                         self.adapter.set_velocity(-self._limits(CREEP, 0.0)[0] if car else 0.0, ang)

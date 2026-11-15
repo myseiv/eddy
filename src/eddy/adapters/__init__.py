@@ -28,7 +28,8 @@ def open_robot(spec: str = "auto") -> Adapter:
         found = [s for s, _ in scan() if s != "sim"]
         spec = found[0] if found else "sim"
     # Whatever follows the colon is the adapter's own option:
-    # "sim:<name>" names the simulated robot, "ros2:<topic>" forces the velocity topic.
+    # "sim:<name>" names the simulated robot; "ros2:<topic>" forces the velocity topic, and
+    # "ros2:<namespace>" picks one robot when several share the ROS graph.
     if spec == "sim" or spec.startswith("sim:"):
         from .sim import SimAdapter
         return SimAdapter(name=spec.partition(":")[2] or "sim-rover")

@@ -9,7 +9,7 @@ import pytest
 
 from eddy import gestures, intents
 from eddy.adapters.line import LineAdapter, LineServer
-from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits, urdf_mimics, cloud_front_range
+from eddy.adapters.ros2 import TWIST, TWIST_STAMPED, classify_graph, front_range, urdf_limits, urdf_mimics, cloud_front_range, robot_namespaces, scan_rotation
 from eddy.adapters.sim import SimAdapter
 from eddy.kinematics import Chain, demo_arm
 from eddy.brain import Eddy
@@ -474,3 +474,63 @@ def test_cloud_range_ignores_sloping_ground_and_sees_what_stands_on_it():
     bz = (-0.6 - 0.08 * 4.0) + rng.uniform(0.2, 0.5, 40)       # a box 4 m ahead, 20 to 50 cm tall
     r = cloud_front_range(np.concatenate((gx, bx)), np.concatenate((gy, by)), np.concatenate((gz, bz)))
     assert r is not None and abs(r - 4.0) < 0.1
+
+
+def test_relative_arm_moves():
+    from eddy.model import MoveBy
+    assert intents.parse("move the arm up 5 cm") == MoveBy(0, 0, 0.05)
+    assert intents.parse("raise the arm") == MoveBy(0, 0, 0.05)
+    assert intents.parse("arm left 10 centimeters") == MoveBy(0, 0.1, 0)
+    assert intents.parse("lower the arm 2 cm") == MoveBy(0, 0, -0.02)
+    assert isinstance(intents.parse("open the hand"), Gripper) and isinstance(intents.parse("turn left"), Drive)
+    sim = SimAdapter()
+    with Eddy(sim, Speaker("silent")) as eddy:
+        assert eddy.tell("reach 0.2 0.1 0.3").ok
+        r = eddy.tell("move the arm up 5 cm")
+        tool = sim.chain.position([sim.joints[n] for n in sim.chain.joint_names])
+        assert r.ok and np.allclose(tool, (0.2, 0.1, 0.35), atol=0.003), (r.message, tool)
+    with Eddy(SimAdapter(arm=False), Speaker("silent")) as eddy:
+        assert not eddy.tell("raise the arm").ok
+
+
+def test_classify_finds_gripper_command_actions():
+    p = classify_graph([], {}, {}, [("/hand_controller/gripper_cmd", ["control_msgs/action/GripperCommand"]),
+                                    ("/arm_controller/follow_joint_trajectory", ["control_msgs/action/FollowJointTrajectory"])])
+    assert p["gripper_commands"] == ["/hand_controller/gripper_cmd"]
+    assert p["arm_actions"] == ["/arm_controller/follow_joint_trajectory"] and p["gripper_actions"] == []
+
+
+def test_robot_namespaces():
+    T, O, S = "geometry_msgs/msg/Twist", "nav_msgs/msg/Odometry", "sensor_msgs/msg/LaserScan"
+    two = [("/tb1/cmd_vel", [T]), ("/tb1/odom", [O]), ("/tb2/cmd_vel", [T]), ("/tb2/odom", [O]), ("/tb2/scan", [S])]
+    assert robot_namespaces(two) == ["/tb1", "/tb2"]
+    # A second command topic on one robot is not a second robot.
+    one = [("/cmd_vel", [T]), ("/controller/cmd_vel", [T]), ("/odom", [O]), ("/scan_raw", [S])]
+    assert robot_namespaces(one) == [""]
+    deep = [("/model/blue/cmd_vel", [T]), ("/model/blue/odometry", [O]), ("/model/green/cmd_vel", [T]), ("/model/green/odometry", [O])]
+    assert robot_namespaces(deep) == ["/model/blue", "/model/green"]
+
+
+def test_classify_finds_a_steering_angle_command():
+    A = "ackermann_msgs/msg/AckermannDriveStamped"
+    p = classify_graph([("/drive", [A]), ("/odom", ["nav_msgs/msg/Odometry"])], {"/drive": 1}, {"/odom": 1})
+    assert p["cmd_vel"] == ("/drive", A)
+    # A velocity topic, where there is one, is still preferred.
+    p = classify_graph([("/drive", [A]), ("/cmd_vel", [TWIST])], {"/drive": 1, "/cmd_vel": 1}, {})
+    assert p["cmd_vel"] == ("/cmd_vel", TWIST)
+
+
+def test_scan_rotation_measures_a_turn_from_two_scans():
+    def room_scan(x, y, heading, half=3.0):
+        out = []
+        for i in range(360):
+            a = heading + math.radians(i) - math.pi
+            dx, dy = math.cos(a), math.sin(a)
+            hits = [((half if d > 0 else -half) - p) / d for p, d in ((x, dx), (y, dy)) if abs(d) > 1e-9]
+            out.append(min(hits))
+        return out
+    inc = math.radians(1)
+    for turn in (0.0, 0.05, -0.08, 0.2):
+        got = scan_rotation(room_scan(0.5, -0.3, 0.3), room_scan(0.5, -0.3, 0.3 + turn), inc)
+        assert abs(got - turn) < math.radians(1.5), (turn, got)
+    assert scan_rotation([1.0] * 10, [1.0] * 12, inc) == 0.0

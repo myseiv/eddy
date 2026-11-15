@@ -28,6 +28,8 @@ TRAJECTORY = "trajectory_msgs/msg/JointTrajectory"      # joint targets for a co
 IMAGES = ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")
 STRING = "std_msgs/msg/String"                          # used for the robot's URDF
 FOLLOW = "control_msgs/action/FollowJointTrajectory"    # joint targets for a controller, as an action
+ACKERMANN = ("ackermann_msgs/msg/AckermannDriveStamped", "ackermann_msgs/msg/AckermannDrive")   # speed + steering angle
+GRIP = "control_msgs/action/GripperCommand"             # open/close a gripper to a position, as an action
 CLOUD = "sensor_msgs/msg/PointCloud2"                   # 3D lidar or depth camera points
 POSES = ("geometry_msgs/msg/PoseWithCovarianceStamped", "geometry_msgs/msg/PoseStamped")   # a position estimate
 
@@ -80,6 +82,13 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
         best = pick(pool, "cmd_vel", sub_counts, bool(sub_counts), pub_counts)
         if best:
             profile["cmd_vel"] = (best, types[best])
+    if "cmd_vel" not in profile:
+        # No velocity command, but a speed-and-steering-angle one (car-like robots, racing
+        # platforms). Only one that something is listening to.
+        cars = {n: t for t in ACKERMANN for n in by_type.get(t, []) if not sub_counts or sub_counts.get(n, 0) > 0}
+        best = pick(list(cars), "drive", sub_counts, bool(sub_counts), pub_counts)
+        if best:
+            profile["cmd_vel"] = (best, cars[best])
     # Sensors: one topic each for odometry, laser scan and joint states.
     for key, type_name, preferred, counts in (
             ("odom", ODOM, "odom", pub_counts), ("scan", SCAN, "scan", pub_counts),
@@ -116,12 +125,40 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
     gripper_actions = [n for n in follow if any(w in n.lower() for w in ("gripper", "hand", "claw"))]
     profile["arm_actions"] = [n for n in follow if n not in gripper_actions]
     profile["gripper_actions"] = gripper_actions
+    # Grippers that take a single "go to this opening" command instead of a trajectory.
+    profile["gripper_commands"] = sorted(n for n, types in (actions or []) if GRIP in types)
     profile["cameras"] = sorted(n for t in IMAGES for n in by_type.get(t, []))
     # The URDF is published as a String on a topic called robot_description.
     descriptions = [n for n in by_type.get(STRING, []) if n.rsplit("/", 1)[-1] == "robot_description"]
     if descriptions:
         profile["description"] = sorted(descriptions, key=len)[0]
     return profile
+
+
+def robot_namespaces(topics: Iterable[Tuple[str, Sequence[str]]]) -> List[str]:
+    """The namespaces that each hold a whole robot, when several robots share one ROS graph.
+
+    A robot's namespace is the deepest prefix of a drive-command topic that also contains one
+    of that robot's sensors, e.g. "/tb1" for /tb1/cmd_vel and /tb1/odom. A robot with no
+    namespace gives "". (A second command topic such as /controller/cmd_vel on a single
+    robot is not a namespace: no sensor lives under /controller.)
+    """
+    topics = list(topics)
+    commands = [n for n, types in topics if any(t in (TWIST, TWIST_STAMPED) + ACKERMANN for t in types)
+                and ("cmd" in n.rsplit("/", 1)[-1] or "drive" in n.rsplit("/", 1)[-1])]
+    sensors = [n for n, types in topics if any(t in (ODOM, SCAN, JOINT_STATE, CLOUD) + POSES for t in types)]
+    found = []
+    for name in commands:
+        parts = name.split("/")[1:-1]
+        ns = ""
+        for depth in range(len(parts), 0, -1):          # deepest ancestor first
+            prefix = "/" + "/".join(parts[:depth])
+            if any(s.startswith(prefix + "/") for s in sensors):
+                ns = prefix
+                break
+        if ns not in found:
+            found.append(ns)
+    return sorted(found)
 
 
 def urdf_limits(urdf: str) -> Dict[str, Tuple[float, float, str]]:
@@ -150,12 +187,14 @@ def urdf_mimics(urdf: str) -> Dict[str, str]:
 
 
 def front_range(ranges: Sequence[float], angle_min: float, angle_increment: float,
-                range_min: float, range_max: float, half_width: float = 0.26) -> Optional[float]:
-    """Nearest valid laser return within +/- half_width radians of straight ahead."""
+                range_min: float, range_max: float, half_width: float = 0.26,
+                center: float = 0.0) -> Optional[float]:
+    """Nearest valid laser return within +/- half_width radians of straight ahead
+    (or of `center`: pi looks straight behind)."""
     best, seen = None, False
     for i, r in enumerate(ranges):
         # The angle of beam i, wrapped to -pi..pi (some lasers report 0..2pi).
-        a = angle_min + i * angle_increment
+        a = angle_min + i * angle_increment - center
         a = math.atan2(math.sin(a), math.cos(a))
         if abs(a) > half_width:
             continue
@@ -167,6 +206,25 @@ def front_range(ranges: Sequence[float], angle_min: float, angle_increment: floa
     if best is None and seen:
         return range_max   # beams point ahead and nothing is within range
     return best            # None if the laser does not look ahead at all
+
+
+def scan_rotation(previous, current, increment: float, limit: float = 0.45, far: float = 10.0) -> float:
+    """How far the robot turned between two full-circle laser scans, in radians (left positive).
+
+    A turn shifts the whole scan sideways, so this finds the shift (up to `limit` radians)
+    that makes the new scan line up best with the old one. It is independent of the wheels,
+    which is the point: wheel odometry cannot tell when the robot is jammed and slipping.
+    """
+    import numpy as np
+    a = np.nan_to_num(np.asarray(previous, dtype=float), nan=far, posinf=far, neginf=far).clip(0.0, far)
+    b = np.nan_to_num(np.asarray(current, dtype=float), nan=far, posinf=far, neginf=far).clip(0.0, far)
+    if len(a) != len(b) or len(a) < 30 or increment <= 0:
+        return 0.0
+    most = max(1, int(limit / increment))
+    shifts = range(-most, most + 1)
+    # After the robot turns left by k beams, what was at beam i + k is now at beam i.
+    errors = [np.abs(b - np.roll(a, -k)).mean() for k in shifts]
+    return shifts[int(np.argmin(errors))] * increment
 
 
 def cloud_xyz(msg):
@@ -242,12 +300,16 @@ class Ros2Adapter(Adapter):
     kind = "ros2"
 
     def __init__(self, discover_seconds: float = 3.0, cmd_vel: Optional[str] = None,
-                 node_name: str = "eddy", max_linear: float = 0.5, max_angular: float = 1.5):
+                 node_name: str = "eddy", max_linear: float = 0.5, max_angular: float = 1.5,
+                 wheelbase: float = 0.33):
         """discover_seconds: how long to watch the graph. cmd_vel: force this velocity topic
         instead of the detected one. max_linear / max_angular: speed limits, since ROS does
         not say how fast a robot may go."""
         self.discover_seconds = discover_seconds
-        self.cmd_vel_override = cmd_vel
+        self.cmd_vel_override = cmd_vel           # a velocity topic to force, or a robot's namespace
+        self.wheelbase = wheelbase                # metres, used only to turn a turn rate into a steering angle
+        self.namespace: Optional[str] = None      # the robot chosen, when several share the graph
+        self.other_robots: List[str] = []
         self.node_name = node_name
         self.max_linear, self.max_angular = max_linear, max_angular
         self.node = None
@@ -256,6 +318,8 @@ class Ros2Adapter(Adapter):
         self._lock = threading.Lock()             # guards _state and _urdf (written by the ROS thread)
         self._urdf: Optional[str] = None
         self._seen = set()                        # which sensors have delivered a first message
+        self._odom_time: Optional[float] = None   # when the last position message arrived
+        self._scan_prev = None                    # the previous full-circle laser scan
         self._pose_counts = {"odom": 0, "pose": 0}   # messages from each source of position
         self._pose_source: Optional[str] = None   # which of them is used, once decided
         self._cloud_subs: Dict[str, object] = {}  # point cloud topic -> subscription
@@ -295,7 +359,22 @@ class Ros2Adapter(Adapter):
         subs = {n: self.node.count_subscribers(n) for n, _ in topics}
         pubs = {n: self.node.count_publishers(n) for n, _ in topics}
         from rclpy.action import get_action_names_and_types
-        self.profile = classify_graph(topics, subs, pubs, get_action_names_and_types(self.node))
+        actions = get_action_names_and_types(self.node)
+        # Several robots on one graph: work with one of them only, so that one robot's
+        # commands are never paired with another robot's sensors.
+        robots = robot_namespaces(topics)
+        wanted = (self.cmd_vel_override or "").rstrip("/")
+        if wanted and wanted in robots:
+            self.namespace, self.cmd_vel_override = wanted, None
+        elif len(robots) > 1 and not self.cmd_vel_override:
+            self.namespace = robots[0]
+        if self.namespace is not None and len(robots) > 1:
+            self.other_robots = [r or "/" for r in robots if r != self.namespace]
+            inside = (lambda n: n.startswith(self.namespace + "/")) if self.namespace else \
+                (lambda n: not any(n.startswith(r + "/") for r in robots if r))
+            topics = [(n, t) for n, t in topics if inside(n)]
+            actions = [(n, t) for n, t in actions if inside(n)]
+        self.profile = classify_graph(topics, subs, pubs, actions)
         if self.cmd_vel_override:
             types = dict((n, t[0]) for n, t in topics)
             self.profile["cmd_vel"] = (self.cmd_vel_override, types.get(self.cmd_vel_override, TWIST))
@@ -305,14 +384,21 @@ class Ros2Adapter(Adapter):
 
     def _discover(self) -> List[Tuple[str, List[str]]]:
         """Wait until the list of topics stops changing."""
-        deadline = time.time() + self.discover_seconds
+        start = time.time()
+        deadline = start + self.discover_seconds
+        # On a busy computer the robot's topics can take longer than that to show up at all.
+        # While nothing but the two topics every node has is visible, keep looking for longer.
+        patience = start + max(self.discover_seconds * 4, 12.0)
         last, stable_since = None, time.time()
-        while time.time() < deadline:
+        while True:
             topics = sorted(self.node.get_topic_names_and_types())
+            now = time.time()
             if topics != last:
-                last, stable_since = topics, time.time()
+                last, stable_since = topics, now
             # More than the two topics every node has, and unchanged for a second: done.
-            elif len(topics) > 2 and time.time() - stable_since > 1.0:
+            elif len(topics) > 2 and now - stable_since > 1.0:
+                break
+            if now >= (deadline if len(topics) > 2 else patience):
                 break
             time.sleep(0.2)
         return last or []
@@ -325,7 +411,13 @@ class Ros2Adapter(Adapter):
         if "cmd_vel" in p:
             topic, type_name = p["cmd_vel"]
             self._twist_stamped = type_name == TWIST_STAMPED
-            self._cmd_pub = node.create_publisher(TwistStamped if self._twist_stamped else Twist, topic, 10)
+            self._ackermann = type_name if type_name in ACKERMANN else None
+            if self._ackermann:
+                from ackermann_msgs.msg import AckermannDrive, AckermannDriveStamped
+                self._cmd_pub = node.create_publisher(
+                    AckermannDriveStamped if type_name.endswith("Stamped") else AckermannDrive, topic, 10)
+            else:
+                self._cmd_pub = node.create_publisher(TwistStamped if self._twist_stamped else Twist, topic, 10)
         # Sensor subscriptions use the "sensor data" quality of service, which matches how
         # robots publish fast sensor streams (latest value wins, nothing is re-sent).
         if "odom" in p:
@@ -377,6 +469,18 @@ class Ros2Adapter(Adapter):
                     "joints": self._controller_joints(name),
                     "gripper": name in p["gripper_actions"],
                 }
+        if p.get("gripper_commands"):
+            try:
+                from control_msgs.action import GripperCommand
+                from rclpy.action import ActionClient
+                for name in p["gripper_commands"]:
+                    # This kind of controller names its one joint in a `joint` parameter.
+                    joint = self._param(name.rsplit("/", 1)[0] or "/", "joint")
+                    self._controllers[name] = {"grip": ActionClient(node, GripperCommand, name),
+                                               "joints": [joint] if isinstance(joint, str) and joint else [],
+                                               "gripper": True}
+            except ImportError:
+                pass
         # Give the first message of everything we subscribed to a moment to arrive. Without
         # this, a command sent straight after connecting would act before the first laser
         # scan or odometry reading, i.e. with no obstacle check and no position.
@@ -500,6 +604,9 @@ class Ros2Adapter(Adapter):
             details["position from"] = p["pose"][0] if self._pose_source == "pose" else p["odom"]
         if "cloud" in p and "scan" not in p:
             details["range from"] = f"{p['cloud']} (3D points: assumes the sensor's x axis points forward; things 15 cm or more above the ground)"
+        if self.other_robots:
+            details["this robot"] = self.namespace or "/"
+            details["other robots here"] = ", ".join(self.other_robots) + "  (choose one with -r ros2:<namespace>)"
         for topic, c in self._controllers.items():
             details[f"controller {topic}"] = ", ".join(c["joints"]) or "joints unknown"
         if p.get("cameras"):
@@ -507,7 +614,10 @@ class Ros2Adapter(Adapter):
         name = ET.fromstring(self._urdf).get("name", "ros2-robot") if self._urdf else "ros2-robot"
         return RobotModel(
             name=name, kind=self.kind,
-            drive=DriveSpec("differential", self.max_linear, self.max_angular) if "cmd_vel" in p else None,
+            # A robot commanded by steering angle is car-like from the start; others are found
+            # out by trying (see the brain).
+            drive=DriveSpec("car-like" if p.get("cmd_vel", ("", ""))[1] in ACKERMANN else "differential",
+                            self.max_linear, self.max_angular) if "cmd_vel" in p else None,
             joints=joints, chain=chain, gripper=any(c["gripper"] and c["joints"] for c in self._controllers.values()),
             sensors=sensors, details=details)
 
@@ -547,12 +657,27 @@ class Ros2Adapter(Adapter):
         with self._lock:
             self._state.x, self._state.y = pose.position.x, pose.position.y
             self._state.heading, self._state.has_odometry = yaw, True
+            self._odom_time = time.monotonic()
 
     def _on_scan(self, msg) -> None:
         """Laser scan: keep only the distance to the nearest thing straight ahead."""
         r = front_range(msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max)
+        back = front_range(msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max, center=math.pi)
+        # Narrow beams along the robot's own axis, for checking that a straight drive really
+        # closes the distance (the wide corridor above would also pick up a wall alongside).
+        axis = [front_range(msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max,
+                            half_width=0.05, center=c) for c in (0.0, math.pi)]
+        # A laser that sees all the way round also shows how far the robot has really turned.
+        full_circle = abs(len(msg.ranges) * msg.angle_increment - 2 * math.pi) < 0.2
+        step = 0.0
+        if full_circle and self._scan_prev is not None and len(self._scan_prev) == len(msg.ranges):
+            step = scan_rotation(self._scan_prev, msg.ranges, msg.angle_increment)
+        self._scan_prev = list(msg.ranges) if full_circle else None
         with self._lock:
-            self._state.range_ahead = r
+            self._state.range_ahead, self._state.range_behind, self._state.range_max = r, back, msg.range_max
+            self._state.axis_ahead, self._state.axis_behind = axis
+            if full_circle:
+                self._state.scan_turn = (self._state.scan_turn or 0.0) + step
             self._seen.add("scan")
 
     def _on_joints(self, msg) -> None:
@@ -572,12 +697,33 @@ class Ros2Adapter(Adapter):
         """A copy of the latest state, so the caller's copy cannot change under it."""
         with self._lock:
             s = self._state
-            return RobotState(s.x, s.y, s.heading, dict(s.joints), s.range_ahead, s.gripper, s.has_odometry)
+            age = None if self._odom_time is None else time.monotonic() - self._odom_time
+            return RobotState(s.x, s.y, s.heading, dict(s.joints), s.range_ahead, s.gripper, s.has_odometry,
+                              range_behind=s.range_behind, range_max=s.range_max, odom_age=age,
+                              scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
 
     def set_velocity(self, linear: float, angular: float) -> None:
         """Publish one velocity command, in whichever Twist flavour the robot uses."""
         if "cmd_vel" not in self.profile:
             raise Unsupported("no velocity command topic found on this robot")
+        if self._ackermann:
+            # Speed and steering angle. The angle that gives the wanted turn rate at this speed
+            # (bicycle model), limited to what steering racks usually allow. Standing still, a
+            # car cannot turn, so the angle is zero.
+            from ackermann_msgs.msg import AckermannDrive, AckermannDriveStamped
+            drive = AckermannDrive()
+            drive.speed = float(linear)
+            if abs(linear) > 1e-6:
+                drive.steering_angle = max(-0.4, min(0.4, math.atan(self.wheelbase * angular / linear)))
+            if self._ackermann.endswith("Stamped"):
+                msg = AckermannDriveStamped()
+                msg.header.stamp = self.node.get_clock().now().to_msg()
+                msg.header.frame_id = "base_link"
+                msg.drive = drive
+                self._cmd_pub.publish(msg)
+            else:
+                self._cmd_pub.publish(drive)
+            return
         from geometry_msgs.msg import Twist, TwistStamped
         twist = Twist()
         twist.linear.x, twist.angular.z = float(linear), float(angular)
@@ -602,7 +748,10 @@ class Ros2Adapter(Adapter):
         msg = JointTrajectory()
         msg.joint_names = list(controller["joints"])
         msg.points = [point]
-        if "client" in controller:
+        if "grip" in controller:
+            # A gripper that takes one position: send the first (only) joint's target.
+            self._send_grip(controller, float(point.positions[0]))
+        elif "client" in controller:
             # Action-driven controller: send the trajectory as a goal. We do not wait for the
             # result here; the brain watches the joint states to see the move finish.
             from control_msgs.action import FollowJointTrajectory
@@ -619,6 +768,16 @@ class Ros2Adapter(Adapter):
                                    + ", ".join(controller["joints"]) + ")")
         else:
             controller["pub"].publish(msg)
+
+    def _send_grip(self, controller: dict, position: float) -> None:
+        """Send a gripper-command controller its target opening."""
+        from control_msgs.action import GripperCommand
+        if not controller["grip"].wait_for_server(timeout_sec=1.0):
+            raise Unsupported("the gripper controller is not answering")
+        goal = GripperCommand.Goal()
+        goal.command.position = position
+        goal.command.max_effort = 10.0      # newtons; a gentle default, since the graph does not say
+        controller["grip"].send_goal_async(goal)
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
         """Hand each joint target to the controller that owns that joint."""
@@ -666,8 +825,9 @@ class Ros2Adapter(Adapter):
             self._executor.shutdown(timeout_sec=2.0)
             self._spin.join(timeout=2.0)
             for c in self._controllers.values():
-                if "client" in c:
-                    c["client"].destroy()
+                for key in ("client", "grip"):
+                    if key in c:
+                        c[key].destroy()
             self.node.destroy_node()
             self.node = None
             if self._we_started_rclpy and self._rclpy.ok():
