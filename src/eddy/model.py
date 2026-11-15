@@ -118,6 +118,7 @@ class RobotState:
     axis_ahead: Optional[float] = None         # metres to whatever is exactly straight ahead (a narrow beam)
     axis_behind: Optional[float] = None        # the same, exactly straight behind
     scan_turn: Optional[float] = None          # radians turned so far as seen by a 360-degree laser (None: unknown)
+    range_age: Optional[float] = None          # seconds since the range sensor last reported (None: always fresh)
     odom_age: Optional[float] = None           # seconds since the position was last updated (None: always fresh)
 
 

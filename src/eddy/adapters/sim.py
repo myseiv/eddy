@@ -123,6 +123,10 @@ class SimAdapter(Adapter):
                           self._range_ahead() if self.has_drive else None,
                           self.gripper if self.has_arm else None, has_odometry=self.has_drive, z=self.z)
 
+    def now(self) -> float:
+        """Simulated seconds since the start."""
+        return self.clock
+
     def wait(self, seconds: float) -> None:
         """Let simulated time pass."""
         if self._live is not None:

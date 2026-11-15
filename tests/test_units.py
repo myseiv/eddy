@@ -564,3 +564,27 @@ def test_a_ground_robot_told_to_take_off_says_it_does_not_fly():
         r = eddy.tell("take off")
         assert not r.ok and "does not seem to be a flying robot" in r.message and sim.clock < 4
         assert eddy.model.drive.kind != "flying"
+
+
+@pytest.mark.parametrize("sentence", [
+    "don't drive forward", "do not go forward 1 meter", "never turn left", "don't open the gripper",
+    "go forward 1 meter or turn left", "not forward, backward 1 meter", "drive forward unless something is there",
+    "go forward 5", "drive forward -5 meters", "turn left -90 degrees", "go up -1 meter", "go up 3",
+])
+def test_negations_choices_and_unclear_amounts_are_not_acted_on(sentence):
+    assert intents.parse_all(sentence) == [], sentence
+
+
+def test_stop_always_wins_and_bare_turn_numbers_are_degrees():
+    for s in ("don't move", "do not move", "no, stop", "cancel", "don't stop", "go forward and stop"):
+        assert intents.parse_all(s) == [Stop()], s
+    assert intents.parse("turn left 45") == Drive(angular=0.8, angle=math.radians(45))
+
+
+def test_moves_too_long_to_finish_are_refused_before_starting():
+    sim = SimAdapter(arm=False)
+    with Eddy(sim, Speaker("silent")) as eddy:
+        for s in ("drive forward 1000 meters", "turn left 100000 degrees", "turn left for 100 minutes"):
+            r = eddy.tell(s)
+            assert not r.ok and "at a time" in r.message and sim.clock < 0.5, (s, r.message)
+        assert abs(sim.x) < 1e-6 and abs(sim.heading) < 1e-6

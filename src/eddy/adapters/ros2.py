@@ -320,6 +320,7 @@ class Ros2Adapter(Adapter):
         self._seen = set()                        # which sensors have delivered a first message
         self._odom_time: Optional[float] = None   # when the last position message arrived
         self._scan_prev = None                    # the previous full-circle laser scan
+        self._range_time: Optional[float] = None  # when the range sensor (laser or point cloud) last reported
         self._pose_counts = {"odom": 0, "pose": 0}   # messages from each source of position
         self._pose_source: Optional[str] = None   # which of them is used, once decided
         self._cloud_subs: Dict[str, object] = {}  # point cloud topic -> subscription
@@ -639,6 +640,7 @@ class Ros2Adapter(Adapter):
         r = cloud_front_range(*columns) if columns is not None else None
         with self._lock:
             self._state.range_ahead = r
+            self._range_time = time.monotonic()
             self._seen.add("cloud")
 
     def _on_odom(self, msg, source: str = "odom") -> None:
@@ -676,6 +678,7 @@ class Ros2Adapter(Adapter):
         with self._lock:
             self._state.range_ahead, self._state.range_behind, self._state.range_max = r, back, msg.range_max
             self._state.axis_ahead, self._state.axis_behind = axis
+            self._range_time = time.monotonic()
             if full_circle:
                 self._state.scan_turn = (self._state.scan_turn or 0.0) + step
             self._seen.add("scan")
@@ -698,9 +701,10 @@ class Ros2Adapter(Adapter):
         with self._lock:
             s = self._state
             age = None if self._odom_time is None else time.monotonic() - self._odom_time
+            range_age = None if self._range_time is None else time.monotonic() - self._range_time
             return RobotState(s.x, s.y, s.heading, dict(s.joints), s.range_ahead, s.gripper, s.has_odometry,
                               range_behind=s.range_behind, range_max=s.range_max, odom_age=age,
-                              z=s.z, scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
+                              z=s.z, range_age=range_age, scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
 
     def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
         """Publish one velocity command, in whichever Twist flavour the robot uses."""

@@ -57,6 +57,9 @@ class Base(Node):
         self.last_cmd = 0.0     # when the last velocity command arrived
         self.wheel = 0.0        # wheel rotation angle, for the joint states
         self.create_subscription(Twist, "/cmd_vel", self.on_cmd, 10)
+        # For the fault tests: "scan_off" / "odom_off" / "all_on" switch the sensors' publishing.
+        self.silent = set()
+        self.create_subscription(String, "/mock/fault", self.on_fault, 10)
         self.decoy = self.create_publisher(Twist, "/teleop/cmd_vel", 10)     # a Twist topic nobody listens to
         self.odom = self.create_publisher(Odometry, "/odom", 10)
         self.scan = self.create_publisher(LaserScan, "/scan", qos_profile_sensor_data)
@@ -65,6 +68,13 @@ class Base(Node):
         self.description = self.create_publisher(String, "/robot_description", latched)
         self.description.publish(String(data=URDF))
         self.create_timer(0.05, self.tick)      # publish sensors 20 times a second
+
+    def on_fault(self, msg: String):
+        """A test asked for a sensor to go quiet (or for everything to come back)."""
+        if msg.data == "all_on":
+            self.silent.clear()
+        else:
+            self.silent.add(msg.data.replace("_off", ""))
 
     def on_cmd(self, msg: Twist):
         """A velocity command arrived: pass it to the simulated rover."""
@@ -94,7 +104,8 @@ class Base(Node):
         odom.pose.pose.position.x, odom.pose.pose.position.y = s.x, s.y
         odom.pose.pose.orientation.z, odom.pose.pose.orientation.w = math.sin(s.heading / 2), math.cos(s.heading / 2)
         odom.twist.twist.linear.x, odom.twist.twist.angular.z = s.v, s.w
-        self.odom.publish(odom)
+        if "odom" not in self.silent:
+            self.odom.publish(odom)
 
         # A 360-beam scan, one beam per degree.
         scan = LaserScan()
@@ -102,7 +113,8 @@ class Base(Node):
         scan.angle_min, scan.angle_max, scan.angle_increment = -math.pi, math.pi, math.radians(1)
         scan.range_min, scan.range_max = 0.05, 8.0
         scan.ranges = [self.ray(scan.angle_min + i * scan.angle_increment) for i in range(360)]
-        self.scan.publish(scan)
+        if "scan" not in self.silent:
+            self.scan.publish(scan)
 
         # Wheel angle: distance moved this tick divided by a 4 cm wheel radius.
         self.wheel += s.v * 0.05 / 0.04

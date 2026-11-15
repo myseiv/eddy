@@ -44,6 +44,7 @@ CREEP = 0.12        # m/s: forward speed used to turn such a robot
 NO_ROOM = "this robot has to roll forward to turn, and something is too close in front of it"
 FLYING = "flying"   # DriveSpec.kind of a robot found to change height on command
 CLIMB = 0.3         # m/s: climb and descent speed
+BLIND = 1.0         # seconds without a range reading after which the last one is not trusted
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
 
 
@@ -162,7 +163,19 @@ class Eddy:
                 self.adapter.stop()
             except Exception:
                 pass
+            if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+                # The link to the robot went quiet. Be plain about what is and is not known.
+                return self._finish(Result(False, f"I lost contact with the robot ({exc}). I sent a stop, but I "
+                                                  "cannot confirm it arrived: check the robot.", command))
             return self._finish(Result(False, f"That failed: {type(exc).__name__}: {exc}", command))
+
+    def _tock(self) -> float:
+        """Seconds since the last call (or since the motion began). Control loops add this up
+        instead of counting ticks, because each exchange with the robot takes real time too:
+        over a slow serial link a loop of 50 ms ticks can take twice as long as it counts."""
+        now = self.adapter.now()
+        passed, self._mark = now - self._mark, now
+        return passed
 
     def _finish(self, result: Result) -> Result:
         """Tell every listener about a result, then hand it back. A broken listener is ignored."""
@@ -238,6 +251,10 @@ class Eddy:
     def _blocked(self, linear: float) -> bool:
         """True if we are about to drive forward into something the range sensor sees."""
         s = self.adapter.state()
+        if linear != 0 and s.range_age is not None and s.range_age > BLIND:
+            # The range sensor was working and has gone quiet. Its last reading says nothing
+            # about now, so the robot must not be driven on the strength of it.
+            raise Refused(f"my range sensor has not reported for {s.range_age:.1f} s, so I will not drive blind")
         if linear < 0:
             # Reversing: only a sensor that also looks behind (a 360-degree laser) can say.
             return s.range_behind is not None and s.range_behind < self.safety.min_range
@@ -247,6 +264,7 @@ class Eddy:
 
     def _drive(self, cmd: Drive, mine: int, trim: bool = True) -> str:
         """Drive a distance, turn an angle, or drive for a time."""
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
         if self.model.drive is None:
             raise Unsupported("this robot cannot drive")
         # Pick default speeds when only a distance or an angle was given, then limit them.
@@ -263,6 +281,14 @@ class Eddy:
             goal, budget = abs(cmd.angle), abs(cmd.angle) / max(abs(ang), 1e-6)
         else:
             goal, budget = None, cmd.duration if cmd.duration is not None else 1.0
+        # A move that could not finish within the time Eddy allows one command is refused now,
+        # rather than driven for a minute and then abandoned somewhere.
+        longest = 2 * self.safety.max_drive_seconds
+        if budget > longest:
+            asked = (f"{goal:.0f} m" if cmd.distance is not None else f"{math.degrees(goal):.0f} degrees") \
+                if goal is not None else f"{budget:.0f} s"
+            raise Refused(f"{asked} would take about {budget:.0f} s, and I do moves of up to {longest:.0f} s at a "
+                          "time. Ask for less, or give it in steps.")
         budget = min(budget, self.safety.max_drive_seconds)
         # A turn with no forward speed asks the robot to turn on the spot. A robot that steers
         # like a car cannot; once Eddy has seen that (below) it creeps forward while turning.
@@ -291,6 +317,8 @@ class Eddy:
         straight = ang == 0 and lin != 0
 
         def seen(state):
+            if state.range_age is not None and state.range_age > BLIND:
+                return None                     # the laser has gone quiet: it cannot be used as a check
             r = state.axis_ahead if lin > 0 else state.axis_behind
             nothing = r is None or (state.range_max is not None and r >= 0.98 * state.range_max)
             return None if nothing else r
@@ -346,7 +374,8 @@ class Eddy:
                                 continue
                             why = "stalled"
                             break
-                        if cmd.angle is not None and not arc and mark_scan is not None and s.scan_turn is not None:
+                        if (cmd.angle is not None and not arc and mark_scan is not None and s.scan_turn is not None
+                                and (s.range_age is None or s.range_age <= BLIND)):
                             # The same idea for turns: the odometry says we turned, but the laser
                             # scan has not rotated to match. The body is jammed against something.
                             claimed = progress - mark_progress
@@ -372,7 +401,7 @@ class Eddy:
                 sent = abs(lin if cmd.distance is not None else ang) * scale
                 step = min(tick, deadline - elapsed)
                 self.adapter.wait(step)
-                elapsed += step
+                elapsed += self._tock()
             else:
                 # The loop ran out of time. With odometry that means the goal was never
                 # reached (the robot is stuck, lifted, or its odometry is not registering).
@@ -414,7 +443,7 @@ class Eddy:
             if arc and self.model.drive.kind == CAR:
                 what += f", rolling forward {path:.2f} m because this robot cannot turn on the spot"
         else:
-            what = f"drove for {elapsed:.1f} s"
+            what = f"{'turned' if spot_turn else 'drove'} for {elapsed:.1f} s (this robot reports no position)"
         if why == "blocked":
             self.speaker.say("Something is in my way.")
             return f"Stopped early, something is in the way ({what})."
@@ -427,7 +456,8 @@ class Eddy:
         seen_turn = None
         # (Only for turns on the spot: while the robot also travels, the scan changes for that
         # reason too and cannot be read as a pure rotation.)
-        if cmd.angle is not None and not arc and start.scan_turn is not None and end.scan_turn is not None:
+        if (cmd.angle is not None and not arc and start.scan_turn is not None and end.scan_turn is not None
+                and (end.range_age is None or end.range_age <= BLIND)):
             seen_turn = abs(end.scan_turn - start.scan_turn)
             if why == "done" and turned >= math.radians(20) and seen_turn < 0.7 * turned:
                 why = "jammed"
@@ -474,6 +504,7 @@ class Eddy:
         Nothing on a robot says whether it flies, so Eddy finds out the way it finds out that
         a robot cannot turn on the spot: it tries, and if the height does not change it says so.
         """
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
         if self.model.drive is None:
             raise Unsupported("this robot cannot move")
         start = self.adapter.state()
@@ -500,7 +531,7 @@ class Eddy:
                 scale = max(0.25, min(1.0, (goal - moved) / 0.3))      # slow down near the height asked for
                 self.adapter.set_velocity(0.0, 0.0, speed * scale)
                 self.adapter.wait(self.safety.tick)
-                elapsed += self.safety.tick
+                elapsed += self._tock()
         finally:
             self.adapter.stop()         # zero velocity: a flying robot hovers
         end = self.adapter.state()
@@ -520,6 +551,7 @@ class Eddy:
 
     def _land(self, mine: int) -> str:
         """Descend until the height stops falling, then stop."""
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
         if self.model.drive is None:
             raise Unsupported("this robot cannot move")
         start = self.adapter.state()
@@ -538,7 +570,7 @@ class Eddy:
                     mark_time, mark_z = elapsed, z
                 self.adapter.set_velocity(0.0, 0.0, speed)
                 self.adapter.wait(self.safety.tick)
-                elapsed += self.safety.tick
+                elapsed += self._tock()
         finally:
             self.adapter.stop()
         end = self.adapter.state()
@@ -548,6 +580,7 @@ class Eddy:
 
     def _wander(self, cmd: Wander, mine: int) -> str:
         """Simple autonomy: go forward, and turn away whenever something is close ahead."""
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
         if self.model.drive is None:
             raise Unsupported("this robot cannot drive")
         if "range" not in self.model.sensors:
@@ -564,6 +597,8 @@ class Eddy:
                 if self._epoch != mine:
                     return f"Interrupted after wandering {elapsed:.0f} s."
                 s = self.adapter.state()
+                if s.range_age is not None and s.range_age > BLIND:
+                    raise Refused(f"my range sensor went quiet after {elapsed:.0f} s of wandering, so I stopped")
                 car = self.model.drive.kind == CAR
                 if turning:
                     turn_done += abs(_wrap(s.heading - last_heading))
@@ -589,7 +624,7 @@ class Eddy:
                     self.adapter.set_velocity(lin, 0.0)                 # path is clear: go forward
                 last_heading = s.heading
                 self.adapter.wait(tick)
-                elapsed += tick
+                elapsed += self._tock()
         finally:
             self.adapter.stop()
         return f"Wandered for {elapsed:.0f} s and turned away from obstacles {turns} times."
@@ -614,6 +649,7 @@ class Eddy:
 
     def _joints(self, positions: dict, mine: int, label: str = "Joints", strict: bool = False) -> str:
         """Move named joints to target positions and wait until they get there."""
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
         if not self.model.joints:
             raise Unsupported("this robot has no joints")
         # Check every name and clamp every value to that joint's limits.
@@ -650,7 +686,7 @@ class Eddy:
                 if all(abs(current.get(n, 1e9) - targets[n]) < 0.02 for n in targets):
                     break
             self.adapter.wait(self.safety.tick)
-            elapsed += self.safety.tick
+            elapsed += self._tock()
         else:
             # The loop ran out of time without a break, i.e. the joints never arrived.
             if feedback:

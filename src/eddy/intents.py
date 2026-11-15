@@ -71,8 +71,14 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
         return Say(raw[re.search(r"(?i)say|speak|tell me", raw).end():].strip(" :,"))
 
     # Stop is checked before any motion, so "stop driving forward" stops.
-    if re.search(r"\b(stop|halt|freeze|whoa|brake|abort|don't move|do not move|stay)\b", t):
+    # (Apostrophes were removed above, so "don't" reads "don t" here.)
+    if re.search(r"\b(stop|halt|freeze|whoa|brake|abort|cancel|don t move|dont move|do not move|stay)\b", t):
         return Stop()
+
+    # A sentence that says what NOT to do, or offers a choice, is not an instruction to act.
+    # ("don't drive forward" must never be read as "drive forward".)
+    if re.search(r"\b(don t|dont|do not|never|not|no|without|won t|shouldn t|can t|cannot|or|unless|if)\b", t):
+        return None
 
     if re.search(r"\b(status|where are you|what are you|who are you|report|what can you do)\b", t):
         return Report()
@@ -123,6 +129,8 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     m = re.search(r"\b(climb|ascend|descend)\b|\b(?:go|fly|move|come)\s+(up|down|higher|lower)\b", t)
     if m:
         word = m.group(1) or m.group(2)
+        if re.search(r"(?<![\w.])-\d", t) or (_amount(t, _LENGTH) is None and re.search(r"\d", t)):
+            return None             # a negative amount, or a number with no unit: not guessed
         return Climb((-1.0 if word in ("descend", "down", "lower") else 1.0) * (_amount(t, _LENGTH) or 0.5))
 
     if re.search(r"\b(wander|explore|roam|look around|patrol)\b", t):
@@ -141,8 +149,14 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             return Drive(angular=w, angle=math.pi)
         # Positive angular speed is left (counter-clockwise); right and clockwise are negative.
         direction = -1.0 if re.search(r"\b(right|clockwise)\b", t) and not re.search(r"counter|anti", t) else 1.0
+        if re.search(r"(?<![\w.])-\d", t):
+            return None             # a negative amount is ambiguous: say the direction instead
         deg = re.search(_NUM + r"\s*(deg|degree|degrees)\b", t)
         duration = _amount(t, _TIME)
+        # A bare number after a turn ("turn left 45") is degrees.
+        bare = re.search(r"(?<![\w.])(\d+(?:\.\d+)?)\s*$", t) if not deg and duration is None else None
+        if bare:
+            return Drive(angular=direction * w, angle=math.radians(float(bare.group(1))))
         if deg:
             return Drive(angular=direction * w, angle=math.radians(_num(deg.group(1))))
         if duration:
@@ -156,6 +170,10 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     if straight or re.search(r"\b(go|drive|move|come|advance|roll|fly)\b", t):
         direction = -1.0 if re.search(r"\b(back|backward|backwards|reverse)\b", t) else 1.0
         distance, duration = _amount(t, _LENGTH), _amount(t, _TIME)
+        if re.search(r"(?<![\w.])-\d", t):
+            return None             # a negative amount is ambiguous: say the direction instead
+        if distance is None and duration is None and re.search(r"\d", t):
+            return None             # "go forward 5": five what? Not guessed.
         if distance is not None:
             return Drive(linear=direction * v, distance=distance)
         if duration is not None:

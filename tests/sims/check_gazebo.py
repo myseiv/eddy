@@ -92,7 +92,7 @@ check(f"turns right 90 degrees (true angle within {TOL})", r.ok and abs(turned +
 notes.append(f"asked 90 right: truly {turned:+.0f}")
 r, moved, turned, b, took = tell("go forward slowly 50 cm")
 check("drives 50 cm slowly (within 0.15 m)", r.ok and abs(moved - 0.5) < 0.15, f"{moved:.2f} m")
-r, moved, turned, b, took = tell("drive forward 15 meters")
+r, moved, turned, b, took = tell("drive forward 10 meters")
 front_gap = FRONT_X - (b[0] + FRONT * math.cos(b[2]))
 check("stops for what is ahead without touching it", "in the way" in r.message and front_gap > 0.02, f"front is {front_gap:.2f} m from it")
 notes.append(f"wall stop: front {front_gap:.2f} m from the wall")
@@ -109,7 +109,7 @@ check("wanders for 40 s", r.ok, r.message)
 if not car:
     # Turning on the spot right up against something can jam the body (Eddy does not know the
     # robot's outline). Whatever happens, Eddy must not report a turn that did not happen.
-    tell("drive forward 15 meters")
+    tell("drive forward 10 meters")
     r, moved, turned, b, took = tell("turn around")
     honest = (not r.ok) or abs(abs(turned) - 180) < 25
     check("turn around right next to an obstacle: completes, or says it is jammed", honest, f"{r.message[:110]}; truly {turned:+.0f}")

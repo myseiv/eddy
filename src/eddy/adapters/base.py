@@ -49,6 +49,10 @@ class Adapter:
         except Unsupported:
             pass        # a robot that cannot drive has nothing to stop
 
+    def now(self) -> float:
+        """The time, in seconds, on the clock this robot runs by. (The simulator has its own.)"""
+        return time.monotonic()
+
     def wait(self, seconds: float) -> None:
         """Let time pass. The simulator overrides this to advance its own clock."""
         time.sleep(seconds)
