@@ -65,7 +65,7 @@ ends by running `eddy doctor` and `eddy selftest` on the Pi. To start Eddy at bo
 |---|---|---|
 | Anything running ROS 2 | `eddy info -r ros2` | Nothing new. Eddy reads the graph (all topics and nodes) and finds the velocity topic, odometry, laser, joint states, trajectory controllers and URDF by itself. |
 | Arduino / ESP32 / Pico on USB | `eddy info -r serial:/dev/ttyUSB0` | Firmware that answers the Eddy line protocol (7 one-line commands, documented in `src/eddy/adapters/line.py`). |
-| A robot on the network | `eddy info -r tcp:192.168.1.20:9000` | The same protocol on a TCP port. `eddy serve` provides it for any robot Eddy can already reach. |
+| A robot on the network | `eddy info -r tcp:192.168.1.20:9000` | The same protocol on a TCP port. `eddy serve` provides it for any robot Eddy can already reach. Serve with `--key <secret>` and connect with the same `--key`, so only you can drive it. A served robot stops by itself if the link drops. |
 | No robot | `eddy info -r sim` | Nothing. |
 
 `eddy scan` lists what it can find. `eddy doctor` says what is installed and what is missing.

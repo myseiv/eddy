@@ -623,3 +623,145 @@ def test_spoken_negations_number_words_and_run_together_commands():
         assert intents.parse_all(s) == [], s
     for w in ("don't", "not", "never", "or", "and", "cancel"):
         assert w in intents.VOCABULARY.split()
+
+
+# ---- link safety -------------------------------------------------------------------
+
+def test_served_robot_stops_when_commands_stop_arriving(served):
+    """The laptop goes quiet mid-drive (crash, Wi-Fi gone) with the connection still open:
+    the served robot stops by itself after the watchdog time."""
+    import time
+    sim, server = served
+    robot = LineAdapter(f"tcp:127.0.0.1:{server.port}")
+    model = robot.connect()
+    assert "stops by itself" in model.details["link loss"]
+    robot.set_velocity(0.2, 0.0)
+    assert sim.v == 0.2
+    time.sleep(server.watchdog + 0.4)
+    assert sim.v == 0.0
+    robot.close()
+
+
+def test_served_robot_keeps_driving_while_commands_keep_arriving(served):
+    """The watchdog must not cut a normal drive short: velocity re-sent every tick keeps it going."""
+    import time
+    sim, server = served
+    robot = LineAdapter(f"tcp:127.0.0.1:{server.port}")
+    robot.connect()
+    end = time.monotonic() + 3 * server.watchdog
+    while time.monotonic() < end:
+        robot.set_velocity(0.2, 0.0)
+        time.sleep(0.05)
+    assert sim.v == 0.2 and sim.x > 0.2
+    robot.close()
+
+
+def test_served_robot_stops_when_the_client_disconnects():
+    """The connection itself drops mid-drive: the robot is stopped at once, not after the watchdog."""
+    import time
+    sim = SimAdapter(name="wire-bot").go_live()
+    server = LineServer(sim, host="127.0.0.1", watchdog=30.0).start()   # so only the disconnect can stop it
+    try:
+        robot = LineAdapter(f"tcp:127.0.0.1:{server.port}")
+        robot.connect()
+        robot.set_velocity(0.2, 0.0)
+        robot.io.close()            # the cable is pulled: no stop command is sent
+        robot.io = None
+        time.sleep(0.3)
+        assert sim.v == 0.0
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def locked():
+    """A served robot that only takes commands from clients holding the key."""
+    sim = SimAdapter(name="locked-bot").go_live()
+    server = LineServer(sim, host="127.0.0.1", key="s3cret").start()
+    yield sim, server
+    server.stop()
+
+
+def test_served_robot_with_a_key_takes_the_right_key(locked):
+    sim, server = locked
+    robot = LineAdapter(f"tcp:127.0.0.1:{server.port}", key="s3cret")
+    assert robot.connect().name == "locked-bot"
+    robot.set_velocity(0.2, 0.0)
+    assert sim.v == 0.2
+    robot.close()
+
+
+def test_served_robot_with_a_key_refuses_no_key_and_the_wrong_key(locked):
+    sim, server = locked
+    for key in (None, "wrong"):
+        robot = LineAdapter(f"tcp:127.0.0.1:{server.port}", key=key)
+        with pytest.raises(RuntimeError, match="key"):
+            robot.connect()
+        robot.close()
+    assert sim.v == 0.0
+
+
+def test_served_robot_with_a_key_ignores_commands_sent_without_logging_in(locked):
+    """A program that skips the handshake and just sends commands gets nowhere, and learns nothing."""
+    import socket
+    sim, server = locked
+    with socket.create_connection(("127.0.0.1", server.port), timeout=2) as sock:
+        f = sock.makefile("rwb")
+        for line in ("V 0.2 0", "J elbow=0.5", "G 1", "?", "AUTH 00", "V 0.2 0"):
+            f.write((line + "\n").encode())
+            f.flush()
+            assert f.readline().decode().startswith("ERR locked"), line
+        f.write(b"EDDY?\n")
+        f.flush()
+        hello = f.readline().decode()
+        assert "auth" in hello and "locked-bot" not in hello and "joints" not in hello
+    assert sim.v == 0.0 and sim.targets["elbow"] == 0.0
+
+
+def test_a_login_answer_cannot_be_replayed_on_another_connection(locked):
+    """The server asks a new question on every connection, so a recorded answer is useless later."""
+    import hashlib, hmac, json, socket
+    sim, server = locked
+
+    def session():
+        sock = socket.create_connection(("127.0.0.1", server.port), timeout=2)
+        f = sock.makefile("rwb")
+        f.write(b"EDDY?\n")
+        f.flush()
+        return sock, f, json.loads(f.readline())["auth"]
+
+    s1, f1, nonce1 = session()
+    answer = hmac.new(b"s3cret", nonce1.encode(), hashlib.sha256).hexdigest()
+    s2, f2, nonce2 = session()
+    assert nonce1 != nonce2
+    f2.write(f"AUTH {answer}\n".encode())
+    f2.flush()
+    assert f2.readline().decode().startswith("ERR locked")
+    f1.write(f"AUTH {answer}\n".encode())
+    f1.flush()
+    assert f1.readline().decode().strip() == "OK"
+    s1.close()
+    s2.close()
+
+
+def test_a_peer_command_meant_for_one_robot_is_refused_by_another():
+    """A signed command recorded on its way to one robot must not work on a second robot
+    that shares the key."""
+    import json
+    from eddy.link import PeerNode
+    a = PeerNode("alpha", key="k", host="127.0.0.1")
+    b = PeerNode("bravo", key="k", host="127.0.0.1")
+    c = PeerNode("charlie", key="k", host="127.0.0.1")
+    try:
+        for node in (b, c):
+            node.on("tell", lambda sender, body: "moved")
+        line = (json.dumps(a._sign({"type": "tell", "body": "drive forward 1 meter"}, to="bravo")) + "\n").encode()
+        refused = c._receive(line)
+        assert not refused["ok"] and "bravo" in refused["error"]
+        assert b._receive(line) == {"ok": True, "body": "moved"}
+        # A signed command that names nobody is refused too.
+        nameless = (json.dumps(a._sign({"type": "tell", "body": "x"})) + "\n").encode()
+        assert not b._receive(nameless)["ok"]
+    finally:
+        for node in (a, b, c):
+            node._server.server_close()

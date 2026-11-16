@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .base import Adapter
 
 
-def open_robot(spec: str = "auto") -> Adapter:
+def open_robot(spec: str = "auto", key: Optional[str] = None) -> Adapter:
     """Turn a spec string into the right adapter. The adapter is not connected yet.
+    key: the shared secret for a network robot that was served with one.
 
     Each adapter module is imported only when its kind is asked for, so a machine
     without ROS or pyserial can still use the others.
@@ -38,7 +39,7 @@ def open_robot(spec: str = "auto") -> Adapter:
         return Ros2Adapter(cmd_vel=spec.partition(":")[2] or None)
     if spec.startswith(("serial:", "tcp:")):
         from .line import LineAdapter
-        return LineAdapter(spec)
+        return LineAdapter(spec, key=key)
     raise ValueError(f"don't know how to open robot '{spec}' (try: sim, ros2, serial:<port>, tcp:<host>:<port>)")
 
 

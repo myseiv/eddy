@@ -24,7 +24,7 @@ from .senses.speak import Speaker
 def _eddy(args, speaker: str = "print") -> Eddy:
     """Build an Eddy for the robot and safety options given on the command line.
     Not every sub-command has --speed and --min-range, hence the getattr defaults."""
-    adapter = open_robot(args.robot)
+    adapter = open_robot(args.robot, key=getattr(args, "key", None))
     safety = Safety(speed_scale=getattr(args, "speed", 1.0), min_range=getattr(args, "min_range", 0.25))
     return Eddy(adapter, Speaker(speaker), safety)
 
@@ -78,13 +78,17 @@ def cmd_shell(args) -> int:
 def cmd_serve(args) -> int:
     """`eddy serve`: put this machine's robot on the network so another machine can drive it."""
     from .adapters.line import LineServer
-    adapter = open_robot(args.robot)
+    adapter = open_robot(args.robot, key=args.key)
     # The simulator normally runs on its own clock; served over the network it must move in real time.
     if hasattr(adapter, "go_live"):
         adapter.go_live()
-    server = LineServer(adapter, port=args.port).start()
-    print(f"Serving {server.model.name} on port {server.port}. Connect with:  eddy shell -r tcp:<this-host>:{server.port}",
-          flush=True)
+    server = LineServer(adapter, port=args.port, key=args.key, watchdog=args.watchdog).start()
+    print(f"Serving {server.model.name} on port {server.port}. Connect with:  eddy shell -r tcp:<this-host>:{server.port}"
+          + (" --key <the same key>" if args.key else ""), flush=True)
+    if not args.key:
+        print("WARNING: no --key given, so anyone who can reach this port can drive the robot. "
+              "Use  --key <secret>  on any network you do not fully control.", flush=True)
+    print(f"The robot stops by itself {args.watchdog:g} s after drive commands stop arriving.", flush=True)
     # The server works in a background thread; this thread just waits for Ctrl-C.
     try:
         while True:
@@ -288,6 +292,8 @@ def main(argv=None) -> int:
                        help="sim, ros2, serial:<port>[@baud], tcp:<host>:<port>, or auto (default)")
         p.add_argument("--speed", type=float, default=1.0, help="scale every speed, e.g. 0.5 for half")
         p.add_argument("--min-range", type=float, default=0.25, help="stop this far (m) from obstacles ahead")
+        p.add_argument("--key", default=os.environ.get("EDDY_KEY"),
+                       help="shared secret: for a tcp: robot served with one, for `serve`, and for --peers")
 
     # One parser per sub-command; set_defaults(fn=...) records which function runs it.
     sub.add_parser("doctor", help="check what works on this machine").set_defaults(fn=cmd_doctor)
@@ -315,13 +321,14 @@ def main(argv=None) -> int:
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--peers", action="store_true", help="find and talk to other Eddy robots on the network")
     p.add_argument("--name", help="this robot's name on the peer link")
-    p.add_argument("--key", default=os.environ.get("EDDY_KEY"), help="shared secret; peers must use the same one")
     p.add_argument("--peer-port", type=int, default=0)
     p.add_argument("--obey", action="store_true", help="carry out commands sent by peers that know the key")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("serve", help="put a robot on the network (Eddy line protocol over TCP)")
     robot_arg(p)
     p.add_argument("--port", type=int, default=9000)
+    p.add_argument("--watchdog", type=float, default=0.5,
+                   help="stop the robot this many seconds after drive commands stop arriving")
     p.set_defaults(fn=cmd_serve)
     p = sub.add_parser("hear", help="recognise speech in a WAV file and carry it out (tests listening without a mic)")
     robot_arg(p)

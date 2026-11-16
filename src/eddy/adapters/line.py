@@ -17,11 +17,27 @@ ESP32, Pico) or any program that would rather open a socket than use ROS.
 must do this: if the cable or radio drops, nothing on the host side can stop the motors.
 
 LineServer is the other end of the same protocol: it puts any adapter on the
-network. That is used for tests, and to drive a robot from another machine.
+network. That is used for tests, and to drive a robot from another machine. It has the
+watchdog described above, and stops the robot at once if the client that was driving it
+disconnects.
+
+A served robot can be locked with a key (a shared secret). Then the handshake goes:
+
+    EDDY?           {"eddy":1,"auth":"<random text, new for every connection>"}
+    AUTH <answer>   OK        (answer = HMAC-SHA256 of that text with the key, in hex)
+    EDDY?           the full description, as above
+
+Until the right answer arrives every other line gets "ERR locked". The key itself never
+crosses the network and an answer cannot be reused on another connection. The lines that
+follow are not signed or encrypted, so this keeps strangers on the network out; it does not
+stop someone who can alter the traffic of a connection that is already logged in.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import socket
 import socketserver
 import threading
@@ -73,13 +89,16 @@ class LineAdapter(Adapter):
     """Talks the Eddy line protocol. target: 'serial:/dev/ttyUSB0@115200' or 'tcp:host:port'."""
     kind = "line"
 
-    def __init__(self, target: str, timeout: float = 2.0, transport=None, reply_timeout: float = 0.4):
+    def __init__(self, target: str, timeout: float = 2.0, transport=None, reply_timeout: float = 0.4,
+                 key: Optional[str] = None):
         """timeout: how long to wait while connecting (a board may still be starting up).
         reply_timeout: how long to wait for an answer once connected. It is short on purpose: a
         control loop that sat waiting two seconds for one lost answer would let the robot's own
         watchdog stop it mid-move.
-        transport: an already open connection to use instead of opening one (for tests)."""
+        transport: an already open connection to use instead of opening one (for tests).
+        key: the shared secret, for a robot that was served with one."""
         self.target = target
+        self.key = key
         self.timeout = timeout
         self.reply_timeout = reply_timeout
         self.io = transport
@@ -171,6 +190,17 @@ class LineAdapter(Adapter):
         if self.io is None:
             self.io = self._open()
         hello = self._handshake()
+        if "auth" in hello:
+            # The robot is locked: prove we hold the key by signing the text it sent, then ask again.
+            if not self.key:
+                raise RuntimeError(f"{self.target} only takes commands from someone holding its key. Give the one "
+                                   "it was served with:  --key <key>  (or set EDDY_KEY)")
+            answer = hmac.new(self.key.encode(), str(hello["auth"]).encode(), hashlib.sha256).hexdigest()
+            try:
+                self._ask(f"AUTH {answer}")
+            except RuntimeError as exc:
+                raise RuntimeError(f"{self.target} refused the key: it is not the one the robot was served with") from exc
+            hello = self._handshake()
         # Connected: from here on answers are expected promptly.
         try:
             if hasattr(self.io, "sock"):
@@ -243,23 +273,40 @@ class LineAdapter(Adapter):
 class LineServer:
     """Serve an adapter over TCP with the line protocol. One robot, many clients."""
 
-    def __init__(self, adapter: Adapter, host: str = "0.0.0.0", port: int = 0, urdf: Optional[str] = None):
-        """Connect the adapter and prepare the server. port=0 lets the system pick a free port."""
+    def __init__(self, adapter: Adapter, host: str = "0.0.0.0", port: int = 0, urdf: Optional[str] = None,
+                 key: Optional[str] = None, watchdog: float = 0.5):
+        """Connect the adapter and prepare the server. port=0 lets the system pick a free port.
+        key: if set, only clients that prove they hold it are answered (see the top of this file).
+        watchdog: seconds after the last drive command at which the robot is stopped."""
         self.adapter = adapter
         self.model = adapter.connect()
         # Pass the arm geometry on to clients, so they can do inverse kinematics too.
         self.urdf = urdf or (self.model.chain.to_urdf() if self.model.chain is not None else None)
+        self.key = key.encode() if key else None
+        self.watchdog = watchdog
         self.lock = threading.Lock()        # one command reaches the robot at a time
+        self._driven = None                 # when the last drive command arrived; None while standing still
+        self._running = False
         outer = self
 
         class Handler(socketserver.StreamRequestHandler):
             """One client connection: answer every line it sends until it disconnects."""
 
             def handle(self):
-                for raw in self.rfile:
-                    reply = outer.handle(raw.decode(errors="replace").strip())
-                    self.wfile.write((reply + "\n").encode())
-                    self.wfile.flush()
+                # What is known about this client: whether it has shown the key, the text it
+                # was asked to sign, and whether it has driven the robot.
+                session = {"trusted": outer.key is None, "nonce": None, "drove": False}
+                try:
+                    for raw in self.rfile:
+                        reply = outer.handle(raw.decode(errors="replace").strip(), session)
+                        self.wfile.write((reply + "\n").encode())
+                        self.wfile.flush()
+                except OSError:
+                    pass                    # the connection broke: same as the client leaving
+                finally:
+                    # The client that was driving has gone. Do not wait for the watchdog.
+                    if session["drove"]:
+                        outer._halt()
 
         class Server(socketserver.ThreadingTCPServer):
             """TCP server with a thread per client."""
@@ -271,21 +318,57 @@ class LineServer:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self) -> "LineServer":
-        """Begin accepting clients in a background thread."""
+        """Begin accepting clients in a background thread, and start the watchdog."""
+        self._running = True
         self.thread.start()
+        threading.Thread(target=self._watch, daemon=True).start()
         return self
 
     def stop(self) -> None:
         """Stop serving and release the robot."""
+        self._running = False
         self.server.shutdown()
         self.server.server_close()
         self.adapter.close()
 
-    def handle(self, line: str) -> str:
-        """Carry out one protocol line on the wrapped adapter and return the answer line."""
+    def _halt(self) -> None:
+        """Stop the robot if it is still under a drive command."""
+        with self.lock:
+            if self._driven is None:
+                return
+            self._driven = None
+            try:
+                self.adapter.stop()
+            except Exception:
+                pass            # nothing more can be done from here
+
+    def _watch(self) -> None:
+        """Thread: stop the robot when drive commands stop arriving. A client that is driving
+        re-sends the speed many times a second, so silence means the client or the link has failed."""
+        while self._running:
+            time.sleep(min(0.05, self.watchdog / 4))
+            driven = self._driven
+            if driven is not None and time.monotonic() - driven > self.watchdog:
+                self._halt()
+
+    def handle(self, line: str, session: Optional[dict] = None) -> str:
+        """Carry out one protocol line on the wrapped adapter and return the answer line.
+        session is what is known about the client that sent it (None: a call from this program)."""
         if not line:
             return "ERR empty"
         op, _, rest = line.partition(" ")       # the command letter, then its arguments
+        if session is not None and not session["trusted"]:
+            # A locked robot tells a stranger nothing and does nothing for it.
+            if op == "EDDY?":
+                session["nonce"] = os.urandom(16).hex()
+                return json.dumps({"eddy": 1, "auth": session["nonce"]})
+            nonce, session["nonce"] = session["nonce"], None        # each text can be answered once
+            if op == "AUTH" and nonce:
+                expected = hmac.new(self.key, nonce.encode(), hashlib.sha256).hexdigest()
+                if hmac.compare_digest(expected, rest.strip()):
+                    session["trusted"] = True
+                    return "OK"
+            return "ERR locked this robot only takes commands from someone holding its key"
         try:
             with self.lock:
                 if op == "EDDY?":
@@ -297,12 +380,17 @@ class LineServer:
                     if m.drive:
                         hello["drive"] = {"kind": m.drive.kind, "max_linear": m.drive.max_linear,
                                           "max_angular": m.drive.max_angular}
+                        hello["watchdog"] = self.watchdog
                     if self.urdf:
                         hello["urdf"] = self.urdf
                     return json.dumps(hello)
                 if op == "V":
                     lin, ang = (float(v) for v in rest.split())
                     self.adapter.set_velocity(lin, ang)
+                    # Remember that the robot is being driven, and by whom, for the watchdog.
+                    self._driven = time.monotonic() if (lin or ang) else None
+                    if session is not None and (lin or ang):
+                        session["drove"] = True
                 elif op == "J":
                     # "name=value" tokens are joint targets; a "T<seconds>" token is the duration.
                     positions, duration = {}, 1.0
@@ -317,6 +405,7 @@ class LineServer:
                     self.adapter.set_gripper(float(rest))
                 elif op == "S":
                     self.adapter.stop()
+                    self._driven = None
                 elif op == "?":
                     s = self.adapter.state()
                     return json.dumps({"x": s.x, "y": s.y, "th": s.heading, "joints": s.joints,

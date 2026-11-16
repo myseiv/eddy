@@ -12,7 +12,8 @@ Message types
     event   something happened to me           (kept in the receiver's inbox)
 
 Trust: if a key is set, every message is signed with HMAC-SHA256 and carries a
-timestamp and a one-time nonce, so a message cannot be forged or replayed. A robot
+timestamp, a one-time nonce and the name of the robot it is for, so a message cannot be
+forged, replayed, or passed on to a different robot. A robot
 never obeys `tell` without a key: an unauthenticated network must not move motors.
 The key is a shared secret, so anyone holding it is fully trusted, and messages
 are signed but not encrypted.
@@ -123,7 +124,8 @@ class PeerNode:
 
     def add_peer(self, name: str, host: str, port: int) -> None:
         """Register a peer by address, for networks where discovery does not work.
-        Manual peers are never forgotten for being quiet."""
+        Manual peers are never forgotten for being quiet. The name must be the one that robot
+        runs under: commands are addressed by name, and a robot refuses one addressed to another."""
         self.peers[name] = {"host": host, "port": port, "caps": [], "seen": time.time(), "manual": True}
 
     # ---- discovery -----------------------------------------------------------
@@ -231,9 +233,12 @@ class PeerNode:
 
     # ---- messages ------------------------------------------------------------
 
-    def _sign(self, msg: dict) -> dict:
-        """Stamp an outgoing message with sender, time and a random nonce, and sign it if we have a key."""
+    def _sign(self, msg: dict, to: Optional[str] = None) -> dict:
+        """Stamp an outgoing message with sender, recipient, time and a random nonce, and sign it
+        if we have a key."""
         msg.update({"from": self.name, "ts": time.time(), "nonce": os.urandom(8).hex()})
+        if to is not None:
+            msg["to"] = to
         if self.key:
             msg["sig"] = hmac.new(self.key, _canonical(msg), hashlib.sha256).hexdigest()
         return msg
@@ -269,6 +274,11 @@ class PeerNode:
         if self.key and not trusted:
             return {"ok": False, "error": "refused: bad or missing signature (do both robots use the same --key?)"}
         kind, sender, body = str(msg["type"]), str(msg.get("from", "?")), msg.get("body")
+        # A signed message is only good for the robot it names. Without this, a command recorded
+        # on its way to one robot could be sent on to another that shares the key.
+        if trusted and msg.get("to") != self.name:
+            return {"ok": False, "error": f"refused: this message is addressed to '{msg.get('to')}', "
+                                          f"and I am '{self.name}'"}
         # A robot without a key still answers harmless questions, but never moves for a stranger.
         if kind in ("tell", "stop") and not trusted:
             return {"ok": False, "error": "refused: this robot only takes commands from peers that share a --key"}
@@ -287,7 +297,7 @@ class PeerNode:
         target = self.peers.get(peer)
         if target is None:
             raise PeerError(f"no peer called '{peer}' (known: {', '.join(sorted(self.peers)) or 'none'})")
-        raw = (json.dumps(self._sign({"type": kind, "body": body})) + "\n").encode()
+        raw = (json.dumps(self._sign({"type": kind, "body": body}, to=peer)) + "\n").encode()
         try:
             # 5 s to connect; then up to `timeout` for the answer, since a command may take a while.
             with socket.create_connection((target["host"], target["port"]), timeout=5) as sock:
@@ -431,7 +441,7 @@ def selftest(check) -> None:
 
         # Replay and tampering: a correctly signed message works once; a second copy, or a
         # copy with its contents changed, is refused.
-        captured = a._sign({"type": "tell", "body": "drive forward 20 cm"})
+        captured = a._sign({"type": "tell", "body": "drive forward 20 cm"}, to="bravo")
         line = (json.dumps(captured) + "\n").encode()
         first = b._receive(line)
         second = b._receive(line)
