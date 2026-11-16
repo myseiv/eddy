@@ -28,6 +28,7 @@ class DriveSpec:
     kind: str = "differential"
     max_linear: float = 0.5   # m/s
     max_angular: float = 1.5  # rad/s
+    slides: Optional[bool] = None   # can it move sideways (mecanum, omni wheels)? None: not found out yet
 
 
 @dataclass
@@ -134,6 +135,13 @@ class Drive:
     distance: Optional[float] = None
     angle: Optional[float] = None
     duration: Optional[float] = None
+
+
+@dataclass
+class Slide:
+    """Move sideways without turning (bases with mecanum or omni wheels)."""
+    distance: float                    # metres; positive is to the robot's left
+    speed: float = 0.15                # m/s
 
 
 @dataclass

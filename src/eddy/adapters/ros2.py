@@ -784,11 +784,13 @@ class Ros2Adapter(Adapter):
                               range_behind=s.range_behind, range_max=s.range_max, odom_age=age,
                               z=s.z, range_age=range_age, scan_turn=s.scan_turn, axis_ahead=s.axis_ahead, axis_behind=s.axis_behind)
 
-    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0, lateral: float = 0.0) -> None:
         """Publish one velocity command, in whichever Twist flavour the robot uses."""
         if "cmd_vel" not in self.profile:
             raise Unsupported("no velocity command topic found on this robot")
         if self._ackermann:
+            if lateral:
+                raise Unsupported("this robot takes a speed and a steering angle, so it cannot move sideways")
             # Speed and steering angle. The angle that gives the wanted turn rate at this speed
             # (bicycle model), limited to what steering racks usually allow. Standing still, a
             # car cannot turn, so the angle is zero.
@@ -810,6 +812,7 @@ class Ros2Adapter(Adapter):
         twist = Twist()
         twist.linear.x, twist.angular.z = float(linear), float(angular)
         twist.linear.z = float(vertical)        # climb rate; ground robots ignore it
+        twist.linear.y = float(lateral)         # sideways speed; bases that cannot move sideways ignore it
         if self._twist_stamped:
             msg = TwistStamped()
             msg.header.stamp = self.node.get_clock().now().to_msg()

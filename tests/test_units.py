@@ -1062,3 +1062,109 @@ def test_an_uncompressed_camera_picture_is_turned_into_jpeg():
     # A compressed picture that is not JPEG is explained too.
     other._on_compressed(SimpleNamespace(format="png", data=b"\x89PNG...."), "/cam/compressed")
     assert other._jpeg is None and "png" in other.camera_note
+
+
+# ---- sideways driving --------------------------------------------------------------
+
+def test_sideways_sentences():
+    from eddy.model import MoveBy, Slide
+    assert intents.parse("slide left 20 cm") == Slide(0.2)
+    assert intents.parse("strafe right 30 cm") == Slide(-0.3)
+    assert intents.parse("Eddy, sidestep left") == Slide(0.2)
+    assert intents.parse("move sideways to the right half a meter") == Slide(-0.5)
+    assert intents.parse("slide left slowly 10 cm") == Slide(0.1, 0.075)
+    for unclear in ("slide 20 cm", "slide left 20", "don't slide left", "slide left -20 cm", "slide left or right"):
+        assert intents.parse(unclear) is None, unclear
+    assert isinstance(intents.parse("slide the arm left 5 cm"), MoveBy)         # the arm, not the base
+    assert [type(c).__name__ for c in intents.parse_all("slide left 20 cm and drive forward 30 cm")] == ["Slide", "Drive"]
+
+
+def _eddy_on(sim):
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    return eddy
+
+
+def test_a_base_that_can_move_sideways_slides_the_distance_asked():
+    sim = SimAdapter(slides=True)
+    eddy = _eddy_on(sim)
+    assert eddy.model.drive.slides is None                                      # not known until tried
+    r = eddy.tell("slide left 30 cm")
+    assert r.ok and "slid 0.30 m to the left" in r.message
+    assert abs(sim.y - 0.3) < 0.01 and abs(sim.x) < 0.005 and sim.heading == 0.0
+    assert eddy.model.drive.slides is True
+    r = eddy.tell("slide right 50 cm")
+    assert r.ok and abs(sim.y + 0.2) < 0.01 and abs(sim.x) < 0.005
+    # Sideways is relative to the way the robot faces: after a left turn, "left" is back along -x.
+    eddy.tell("turn left 90 degrees")
+    r = eddy.tell("slide left 20 cm")
+    assert r.ok and abs(sim.x + 0.2) < 0.02 and abs(sim.y + 0.2) < 0.02
+
+
+def test_a_base_that_cannot_move_sideways_is_found_out_by_trying():
+    sim = SimAdapter()                                                          # ordinary two-wheel base
+    eddy = _eddy_on(sim)
+    r = eddy.tell("slide left 20 cm")
+    assert not r.ok and "does not seem to be able to move sideways" in r.message
+    assert (sim.x, sim.y, sim.v, sim.w) == (0.0, 0.0, 0.0, 0.0) and eddy.model.drive.slides is False
+    before = sim.clock
+    r = eddy.tell("slide right 20 cm")                                          # now known: refused at once
+    assert not r.ok and "tried earlier" in r.message and sim.clock == before
+    assert eddy.tell("drive forward 20 cm").ok                                  # ordinary driving is unaffected
+
+
+def test_sliding_is_refused_where_it_cannot_be_done_safely():
+    eddy = _eddy_on(SimAdapter(slides=True))
+    r = eddy.tell("slide left 2 meters")
+    assert not r.ok and "at most 1 m" in r.message
+    car = SimAdapter(car=True)
+    eddy = _eddy_on(car)
+    eddy.tell("turn left 45 degrees")                                           # finds out it steers like a car
+    r = eddy.tell("slide left 20 cm")
+    assert not r.ok and "steers like a car" in r.message
+    assert not _eddy_on(SimAdapter(drive=False)).tell("slide left 20 cm").ok
+
+
+def test_sliding_into_a_wall_stops_and_says_so():
+    sim = SimAdapter(slides=True, room=0.5)                                     # walls 0.35 m to each side of the robot
+    eddy = _eddy_on(sim)
+    r = eddy.tell("slide left 80 cm")
+    assert not r.ok and "blocking it on that side" in r.message and sim.vy == 0.0
+    assert eddy.model.drive.slides is True                                      # it can slide; it was blocked
+    r = eddy.tell("slide left 20 cm")
+    assert not r.ok and "blocking" in r.message
+    assert eddy.tell("slide right 20 cm").ok
+
+
+def test_stop_interrupts_a_slide():
+    import threading, time
+    sim = SimAdapter(slides=True, realtime=True)
+    eddy = _eddy_on(sim)
+    out = []
+    worker = threading.Thread(target=lambda: out.append(eddy.tell("slide left 90 cm")))
+    worker.start()
+    time.sleep(0.6)
+    eddy.tell("stop")
+    worker.join(timeout=3)
+    assert not worker.is_alive() and "Interrupted" in out[0].message and 0.01 < sim.y < 0.4 and sim.vy == 0.0
+
+
+def test_a_robot_reached_over_the_line_protocol_cannot_slide(served):
+    sim, server = served
+    eddy = Eddy(LineAdapter(f"tcp:127.0.0.1:{server.port}"), Speaker("silent"))
+    eddy.start()
+    r = eddy.tell("slide left 20 cm")
+    assert not r.ok and "no sideways command" in r.message and sim.y == 0.0
+    eddy.close()
+
+
+def test_half_a_meter_is_half_a_meter():
+    """ "half a meter" used to be read as "a meter": twice the distance asked for."""
+    assert intents.parse("drive forward half a meter").distance == 0.5
+    assert intents.parse("go back a quarter of a meter").distance == 0.25
+    assert intents.parse("turn left for half a second").duration == 0.5
+    assert intents.parse("drive forward a meter").distance == 1.0
+    # "one and a half meters" used to be read as half a metre.
+    assert [c.distance for c in intents.parse_all("drive forward one and a half meters")] == [1.5]
+    assert [c.distance for c in intents.parse_all("go back two and a half meters")] == [2.5]
+    assert intents.parse("drive forward half meter").distance == 0.5

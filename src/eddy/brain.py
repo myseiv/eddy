@@ -16,7 +16,7 @@ from typing import Callable, List, Optional
 
 from . import gestures, intents, runlog
 from .adapters.base import Adapter
-from .model import (Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Refused, Report, RobotModel, Say, SetJoints, Stop,
+from .model import (Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Refused, Report, RobotModel, Say, SetJoints, Slide, Stop,
                     Unsupported, Wander)
 from .senses.speak import Speaker
 
@@ -49,6 +49,7 @@ FLYING = "flying"   # DriveSpec.kind of a robot found to change height on comman
 CLIMB = 0.3         # m/s: climb and descent speed
 BLIND = 1.0         # seconds without a range reading after which the last one is not trusted
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
+SIDE = 1.0          # metres: the most Eddy slides sideways in one command, since it cannot see to the side
 
 
 def _wrap(a: float) -> float:
@@ -263,6 +264,8 @@ class Eddy:
         """Send a motion command to the method that knows how to do it."""
         if isinstance(command, Drive):
             return self._drive(command, mine)
+        if isinstance(command, Slide):
+            return self._slide(command, mine)
         if isinstance(command, Wander):
             return self._wander(command, mine)
         if isinstance(command, TakeOff):
@@ -556,6 +559,82 @@ class Eddy:
             turned -= abs(_wrap(self.adapter.state().heading - before))
             what = f"turned {math.degrees(turned):.0f} degrees"
         return f"Done: {what}."
+
+    def _slide(self, cmd: Slide, mine: int) -> str:
+        """Move sideways by a distance without turning, measured by the robot's own position.
+
+        Nothing on a robot says whether its base can move sideways (the speed message has a
+        sideways field on every robot; most bases ignore it). So Eddy finds out the way it finds
+        out that a robot cannot turn on the spot: it tries, watches the position, and remembers.
+        """
+        self._mark = self.adapter.now()     # for _tock(): real time, not a count of ticks
+        drive = self.model.drive
+        if drive is None:
+            raise Unsupported("this robot cannot drive")
+        cannot = "this robot cannot move sideways (only bases with mecanum or omni wheels can)"
+        if drive.kind == CAR or drive.slides is False:
+            raise Refused(cannot + ("; it steers like a car" if drive.kind == CAR else "; I tried earlier and it did not"))
+        goal, side = abs(cmd.distance), (1.0 if cmd.distance > 0 else -1.0)
+        if goal > SIDE + 1e-9:
+            raise Refused(f"I cannot see to the side, so I slide at most {SIDE:.0f} m at a time. Ask for less.")
+        start = self.adapter.state()
+        if not start.has_odometry:
+            raise Refused("I will not move sideways without a position reading: I could not tell how far the robot went")
+        speed = min(abs(cmd.speed) * self.safety.speed_scale, drive.max_linear)
+        deadline = min(goal / max(speed, 1e-6) * 2 + 3, 2 * self.safety.max_drive_seconds)
+        sin0, cos0 = math.sin(start.heading), math.cos(start.heading)
+
+        def moved():
+            """How far the robot has gone sideways (in the direction asked) and forwards since the start."""
+            s = self.adapter.state()
+            dx, dy = s.x - start.x, s.y - start.y
+            return side * (dy * cos0 - dx * sin0), dx * cos0 + dy * sin0
+
+        elapsed, done, along, mark_time, mark_done, why = 0.0, 0.0, 0.0, 0.0, 0.0, "timeout"
+        try:
+            while elapsed < deadline:
+                if self._epoch != mine:
+                    why = "interrupted"
+                    break
+                done, along = moved()
+                if goal - done <= 0.004:
+                    why = "done"
+                    break
+                if abs(along) > 0.05 and abs(along) > 2 * abs(done):
+                    why = "wrong way"       # it is rolling forwards or backwards instead
+                    break
+                if elapsed - mark_time >= STALL:
+                    if done - mark_done < 0.005:
+                        why = "stalled"
+                        break
+                    mark_time, mark_done = elapsed, done
+                scale = max(0.25, min(1.0, (goal - done) / 0.12))      # slow down near the distance asked for
+                self.adapter.set_velocity(0.0, 0.0, lateral=side * speed * scale)
+                self.adapter.wait(self.safety.tick)
+                elapsed += self._tock()
+        finally:
+            self.adapter.stop()
+        self.adapter.wait(0.3)              # let it come to rest before measuring
+        done, along = moved()
+        way = "left" if side > 0 else "right"
+        if done >= 0.03 and why != "wrong way":
+            drive.slides = True             # it moved sideways on command: remember that it can
+        if why == "wrong way":
+            drive.slides = False
+            raise Refused(f"I stopped: asked to slide {way}, the robot rolled {abs(along):.2f} m "
+                          f"{'forwards' if along > 0 else 'backwards'} instead. It does not move sideways the way I expected.")
+        if why == "stalled" and done < 0.03:
+            if drive.slides:
+                raise Refused(f"the robot is not moving {way}: something may be blocking it on that side")
+            drive.slides = False
+            raise Refused("commanding the robot sideways changed nothing. It does not seem to be able to move "
+                          "sideways (only bases with mecanum or omni wheels can).")
+        if why in ("stalled", "timeout"):
+            raise Refused(f"I stopped because the robot was no longer getting anywhere: I only slid {done:.2f} m "
+                          f"of the {goal:.2f} m asked for. Something may be blocking it on that side.")
+        if why == "interrupted":
+            return f"Interrupted (slid {done:.2f} m {way})."
+        return f"Done: slid {done:.2f} m to the {way}."
 
     def _climb(self, dz: float, mine: int, label: str) -> str:
         """Go straight up or down by dz metres, measured by the robot's own height reading.

@@ -22,6 +22,9 @@ Taken from Hiwonder's MentorPi source (driver/controller), which the owner suppl
   - on the MentorPi the app path (/cmd_vel) limits speed to 0.2 m/s and 0.5 rad/s
   - /odom is a filter over the commanded speed, laser odometry and the IMU, not wheel
     encoders; here it is simply the true pose
+  - the driver for the mecanum base reads a sideways speed (linear.y), limited to 0.2 m/s
+    (odom_publisher_node.py), and Hiwonder's own programs drive sideways that way. Sliding has
+    not been observed on the real LanderPi; here the base slides exactly as commanded
 Assumed (not observed): the linkage joints are marked <mimic> in the URDF, their names, the
 arm's link lengths, and that laser angle 0 is the robot's front.
 
@@ -110,7 +113,8 @@ class Base(Node):
 
     def on_cmd(self, msg: Twist):
         self.last_cmd = time.monotonic()
-        self.sim.set_velocity(msg.linear.x, msg.angular.z)
+        # The mecanum base also takes a sideways speed, limited to 0.2 m/s as in Hiwonder's driver.
+        self.sim.set_velocity(msg.linear.x, msg.angular.z, lateral=max(-0.2, min(0.2, msg.linear.y)))
 
     def ray(self, angle: float) -> float:
         """Distance to the room's wall along one laser beam."""
@@ -121,7 +125,7 @@ class Base(Node):
 
     def tick(self):
         s = self.sim
-        if time.monotonic() - self.last_cmd > 0.5 and (s.v or s.w):
+        if time.monotonic() - self.last_cmd > 0.5 and (s.v or s.w or s.vy):
             s.set_velocity(0.0, 0.0)                    # command timeout
         # The arm's joints move towards their targets at 1.5 rad/s.
         for name, target in self.arm["target"].items():
@@ -176,7 +180,8 @@ class Controller(Node):
 
 def main():
     rclpy.init()
-    sim = SimAdapter(name=KIND, arm=False, car=(0.145 if KIND == "car" else False)).go_live()
+    sim = SimAdapter(name=KIND, arm=False, car=(0.145 if KIND == "car" else False),
+                     slides=(KIND == "landerpi")).go_live()
     names = ARM + ["r_joint"] if KIND == "landerpi" else []
     arm = {"now": {n: 0.0 for n in names}, "target": {n: 0.0 for n in names}}
     nodes = [App(), Base(sim, arm)]

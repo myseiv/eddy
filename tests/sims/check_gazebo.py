@@ -77,6 +77,11 @@ notes.append(f"backing into the wall: reply came about {max(0, pushing):.0f} s a
 
 r, moved, turned, b, took = tell("drive forward 2 meters")
 check("drives 2 m (true distance within 0.25 m)", r.ok and abs(moved - 2.0) < 0.25, f"{moved:.2f} m")
+
+# These vehicles cannot move sideways. Nothing on the ROS graph says so: Eddy has to find out.
+r, moved, turned = tell("slide left 20 cm")[:3]
+check("asked to slide, finds it cannot and leaves the robot where it is",
+      not r.ok and "sideways" in r.message and moved < 0.03 and abs(turned) < 3, f"{r.message[:90]}; truly moved {moved:.2f} m")
 notes.append(f"asked 2.00 m forward: truly {moved:.2f} m")
 r, moved, turned, b, took = tell("turn left 90 degrees")
 car = model.drive.kind == "car-like"

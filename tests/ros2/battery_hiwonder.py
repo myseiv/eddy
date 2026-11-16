@@ -71,6 +71,26 @@ r, moved, turned, b = tell("go back 6 meters")
 check("stops for the wall behind it without touching it (the laser sees all round)",
       "in the way" in r.message and not b["bumped"], r.message)
 r, moved, turned, b = tell("drive forward 1 meter")
+# Sideways: the mecanum base slides; the car is found not to, and is not moved.
+a = truth()
+r, moved, turned, b = tell("slide left 30 cm")
+# How far it truly went to its own left, and forwards, from where it was.
+left = (b["y"] - a["y"]) * math.cos(a["heading"]) - (b["x"] - a["x"]) * math.sin(a["heading"])
+ahead = (b["x"] - a["x"]) * math.cos(a["heading"]) + (b["y"] - a["y"]) * math.sin(a["heading"])
+if KIND == "landerpi":
+    check("slides 30 cm to its left without turning or rolling forward",
+          r.ok and abs(left - 0.3) < 0.03 and abs(ahead) < 0.02 and abs(turned) < 2, f"left {left:.2f}, ahead {ahead:.2f}; {r.message}")
+    check("has learned that it can move sideways", model.drive.slides is True)
+    r, moved, turned, b2 = tell("slide right 30 cm")
+    check("slides back to where it was", r.ok and math.hypot(b2["x"] - a["x"], b2["y"] - a["y"]) < 0.03, r.message)
+    r, moved, *_ = tell("slide left 3 meters")
+    check("refuses a slide longer than it will do blind", not r.ok and moved < 0.01, r.message)
+else:
+    check("a car asked to slide is told it cannot, and does not move",
+          not r.ok and "sideways" in r.message and moved < 0.01 and abs(turned) < 1, r.message)
+    r, moved, *_ = tell("slide right 20 cm")
+    check("and is refused at once the second time", not r.ok and moved < 0.01, r.message)
+
 r, moved, turned, b = tell("wander for 25 seconds")
 check("wanders and turns away from walls", r.ok and "0 times" not in r.message, r.message)
 r, *_ = tell("dance")

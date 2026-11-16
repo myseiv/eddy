@@ -33,7 +33,9 @@ def open_robot(spec: str = "auto", key: Optional[str] = None) -> Adapter:
     # "ros2:<namespace>" picks one robot when several share the ROS graph.
     if spec == "sim" or spec.startswith("sim:"):
         from .sim import SimAdapter
-        return SimAdapter(name=spec.partition(":")[2] or "sim-rover")
+        name = spec.partition(":")[2] or "sim-rover"
+        # "sim:mecanum" is a simulated base that can move sideways, for trying "slide left 20 cm".
+        return SimAdapter(name=name, slides=(name == "mecanum"))
     if spec == "ros2" or spec.startswith("ros2:"):
         from .ros2 import Ros2Adapter
         return Ros2Adapter(cmd_vel=spec.partition(":")[2] or None)

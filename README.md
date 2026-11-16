@@ -35,7 +35,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/eddy shell -r sim
 ```
 
-Then type things like `drive forward 1 meter`, `turn left 90 degrees`, `reach 0.2 0.1 0.3`,
+Then type things like `drive forward 1 meter`, `turn left 90 degrees`, `slide left 20 cm` (bases that can move sideways; try it with `-r sim:mecanum`), `reach 0.2 0.1 0.3`,
 `close the gripper`, `wander for 30 seconds`, `status`, `stop`.
 
 ## Put it on a Raspberry Pi

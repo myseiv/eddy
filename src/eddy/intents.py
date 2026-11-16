@@ -9,7 +9,7 @@ import math
 import re
 from typing import Optional
 
-from .model import Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Report, Say, SetJoints, Stop, Wander
+from .model import Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Report, Say, SetJoints, Slide, Stop, Wander
 
 # Number words and the value each stands for, so "two meters" works as well as "2 meters".
 _WORDS = {"zero": 0, "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -50,6 +50,13 @@ def _num(token: str) -> float:
 
 def _amount(text: str, units: dict) -> Optional[float]:
     """Find "<number> <unit>" in the text and return it in base units (metres or seconds)."""
+    # "half a meter" and "a quarter of a second" are a half and a quarter, not "a meter".
+    names = "|".join(sorted(units, key=len, reverse=True))
+    # "one and a half meters": the number plus a half.
+    m = re.search(_NUM + r"\s+and\s+a\s+half\s*(" + names + r")\b", text)
+    if m:
+        return (_num(m.group(1)) + 0.5) * units[m.group(2)]
+    text = re.sub(r"\b(?:a\s+|one\s+)?(half|quarter)\s+(?:of\s+)?an?\s+", r"\1 ", text)
     m = re.search(_NUM + r"\s*(" + "|".join(sorted(units, key=len, reverse=True)) + r")\b", text)
     return _num(m.group(1)) * units[m.group(2)] if m else None
 
@@ -124,6 +131,18 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
             x, y, z = (float(v) * scale for v in nums[:3])
             return MoveTo(x, y, z)
         return None
+
+    # Sideways, for bases that can: "slide left 20 cm", "strafe right 30 cm", "sidestep left".
+    # With no amount it moves 20 cm. The direction must be said.
+    if re.search(r"\b(slide|strafe|sidestep|sideways|crab)\b", t):
+        side = re.search(r"\b(left|right)\b", t)
+        if not side or re.search(r"(?<![\w.])-\d", t):
+            return None
+        distance = _amount(t, _LENGTH)
+        if distance is None and (re.search(r"\d", t) or _amount(t, _TIME) is not None):
+            return None             # "slide left 20": twenty what? Not guessed.
+        slow = 0.5 if re.search(r"\b(slow|slowly|careful|carefully)\b", t) else 1.0
+        return Slide((1.0 if side.group(1) == "left" else -1.0) * (distance or 0.2), 0.15 * slow)
 
     # Flying: "take off", "take off to 2 meters", "land", "go up 50 cm", "descend 1 meter".
     if re.search(r"\b(take off|takeoff|lift off|liftoff|launch)\b", t):

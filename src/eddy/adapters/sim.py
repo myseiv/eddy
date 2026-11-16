@@ -23,8 +23,10 @@ class SimAdapter(Adapter):
 
     def __init__(self, name: str = "sim-rover", room: float = 2.0, realtime: bool = False,
                  arm: bool = True, drive: bool = True, car: bool = False,
-                 flies: bool = False):
+                 flies: bool = False, slides: bool = False):
         self.name = name
+        self.slides = slides        # True: a base that can move sideways (mecanum wheels)
+        self.vy = 0.0               # commanded sideways speed, positive to the left
         self.flies = flies          # True: a flying robot, which obeys climb commands
         self.z = self.vz = 0.0      # height and commanded climb rate
         self.car = car              # True: steers like a car, so it cannot turn without rolling
@@ -81,12 +83,13 @@ class SimAdapter(Adapter):
     # The three command calls only record what was asked for; _advance_locked() does the moving.
     # Without the matching ability they fall through to the base class, which raises Unsupported.
 
-    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
-        """Remember the commanded speeds. (A robot that does not fly ignores the climb rate,
-        as a real ground robot's base would.)"""
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0, lateral: float = 0.0) -> None:
+        """Remember the commanded speeds. (A robot that does not fly ignores the climb rate, and
+        one that cannot move sideways ignores the sideways speed, as real bases do.)"""
         if not self.has_drive:
             return super().set_velocity(linear, angular)
         self.v, self.w = float(linear), float(angular)
+        self.vy = float(lateral) if self.slides else 0.0
         self.vz = float(vertical) if self.flies else 0.0
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
@@ -156,8 +159,8 @@ class SimAdapter(Adapter):
             tightest = 0.25 if self.car is True else float(self.car or 0)     # turning circle radius, m
             w = max(-abs(self.v) / tightest, min(abs(self.v) / tightest, self.w)) if self.car else self.w
             self.heading = math.atan2(math.sin(self.heading + w * dt), math.cos(self.heading + w * dt))
-            nx = self.x + self.v * math.cos(self.heading) * dt
-            ny = self.y + self.v * math.sin(self.heading) * dt
+            nx = self.x + (self.v * math.cos(self.heading) - self.vy * math.sin(self.heading)) * dt
+            ny = self.y + (self.v * math.sin(self.heading) + self.vy * math.cos(self.heading)) * dt
             limit = self.room - self.radius
             self.z = max(0.0, self.z + self.vz * dt)        # the ground is at height zero
             if self.flies and self.z <= 0.0:

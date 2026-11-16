@@ -29,9 +29,10 @@ class Adapter:
         """Where the robot is right now. By default: an empty state with no odometry."""
         return RobotState()
 
-    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0) -> None:
-        """Drive the base: forward speed in m/s, turn rate in rad/s (positive is left), and
-        for robots that fly, climb rate in m/s (positive is up)."""
+    def set_velocity(self, linear: float, angular: float, vertical: float = 0.0, lateral: float = 0.0) -> None:
+        """Drive the base: forward speed in m/s, turn rate in rad/s (positive is left), for
+        robots that fly, climb rate in m/s (positive is up), and for bases that can move
+        sideways, sideways speed in m/s (positive is left)."""
         raise Unsupported("this robot cannot drive")
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
