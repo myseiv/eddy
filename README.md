@@ -70,6 +70,29 @@ ends by running `eddy doctor` and `eddy selftest` on the Pi. To start Eddy at bo
 
 `eddy scan` lists what it can find. `eddy doctor` says what is installed and what is missing.
 
+## Control it from a web page
+
+```bash
+eddy web -r ros2
+```
+
+Eddy prints a link. Open it on a laptop or phone on the same network: the robot's camera, where
+it is, a box to type commands in, and a big stop button. Nothing extra to install. The link
+carries a short code that changes every start, so only someone who saw the robot's terminal can
+drive it. A camera that publishes compressed pictures needs nothing; an uncompressed one needs
+OpenCV on the robot (the page says so if that is the case).
+
+## See what happened
+
+Every `eddy do`, `shell`, `run` and `web` session is logged, one line per command, with the
+robot's state before and after:
+
+```bash
+eddy log
+```
+
+The files are in `~/.eddy/logs` (JSON lines). `--no-log` switches it off.
+
 ## Everything on
 
 ```bash
@@ -78,7 +101,10 @@ eddy run -r ros2 --speak --voice --gestures --peers --key my-secret --obey
 
 - `--voice` listens offline; say "Eddy, drive forward one meter".
 - `--gestures` watches the camera: open palm or fist = stop, point = forward, V = back, thumb sideways = turn that way.
-- `--peers` finds other Eddy robots on the network. In the prompt, `peers` lists them and `@name turn left` sends a command to one.
+- `--peers` finds other Eddy robots on the network. In the prompt, `peers` lists them and where they are, `@name turn left` sends a command to one, and `@all stop` stops them all.
+- `--peer 192.168.1.21` adds a robot by address, for networks where robots do not find each other (many Wi-Fi networks).
+- `--start 2,0,180` says where this robot is now (x, y in metres and heading in degrees) from a mark on the floor that all the robots use. With it, robots tell each other positions that mean the same thing to all of them.
+- The robot's own operator comes first: a peer cannot take over a move the operator asked for, or restart the robot for 10 s after the operator stopped it. A peer can always stop it.
 - `--obey` lets peers that hold the same `--key` command this robot. Without it, the robot answers questions and honours `stop`, but will not move for anyone else.
 
 ## Safety built in

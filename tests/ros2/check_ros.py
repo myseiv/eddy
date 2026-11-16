@@ -73,6 +73,45 @@ check("arm goes home", r.ok and all(abs(adapter.state().joints[n]) < 0.03 for n 
 
 r = eddy.tell("status")
 check("reports its state", r.ok and "mockbot" in r.message, r.message)
+
+# -- camera and web page
+import json
+import time
+import urllib.request
+from eddy.web import WebPage
+
+check("finds the cameras and will try compressed colour first",
+      [n for n, _ in adapter.profile["camera_feeds"]][:1] == ["/camera/color/image_raw/compressed"],
+      ", ".join(n for n, _ in adapter.profile["camera_feeds"]))
+deadline, frame = time.time() + 6, None
+while time.time() < deadline and frame is None:
+    frame = adapter.camera_frame()
+    time.sleep(0.05)
+check("reads a picture from the robot's camera", bool(frame) and frame[:2] == b"\xff\xd8" and b"mock frame" in frame,
+      adapter.camera_note if not frame else f"{len(frame)} bytes")
+first = frame
+time.sleep(0.5)
+check("the picture keeps updating", adapter.camera_frame() != first)
+
+page = WebPage(eddy, host="127.0.0.1", port=0, code="t3st").start()
+base = f"http://127.0.0.1:{page.port}"
+with urllib.request.urlopen(f"{base}/camera.mjpg?t=t3st", timeout=5) as stream:
+    chunk = stream.read(400)
+check("web page: streams the robot's camera", chunk.count(b"mock frame") >= 2 and b"image/jpeg" in chunk)
+before = adapter.state()
+urllib.request.urlopen(urllib.request.Request(f"{base}/tell?t=t3st", data=b"turn right 45 degrees"), timeout=5).read()
+deadline = time.time() + 15
+while time.time() < deadline:
+    state = json.loads(urllib.request.urlopen(f"{base}/state?t=t3st", timeout=5).read())
+    if state["results"] and not state["busy"]:
+        break
+    time.sleep(0.2)
+turned = math.degrees(abs(math.atan2(math.sin(adapter.state().heading - before.heading),
+                                     math.cos(adapter.state().heading - before.heading))))
+check("web page: a command typed in the page turns the robot", abs(turned - 45) < 6 and state["results"][-1]["ok"],
+      f"turned {turned:.0f} degrees; {state['results'][-1]['message'] if state['results'] else 'no result'}")
+check("web page: shows the robot's name, position and camera", state["name"] == "mockbot" and state["camera"] and state["position"])
+page.stop()
 eddy.close()
 
 print("\n" + ("All ROS 2 checks passed." if not failures else f"FAILED: {'; '.join(failures)}"))

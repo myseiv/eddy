@@ -18,6 +18,7 @@ from .base import Adapter
 class SimAdapter(Adapter):
     """The simulated rover. arm=False or drive=False gives a robot without that ability,
     which the tests use to check that Eddy refuses what a robot cannot do."""
+    camera_note = "The simulator has no camera."
     kind = "sim"
 
     def __init__(self, name: str = "sim-rover", room: float = 2.0, realtime: bool = False,

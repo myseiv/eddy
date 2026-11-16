@@ -765,3 +765,300 @@ def test_a_peer_command_meant_for_one_robot_is_refused_by_another():
     finally:
         for node in (a, b, c):
             node._server.server_close()
+
+
+# ---- robots working together -------------------------------------------------------
+
+def _peer_robot(name, made, start=None, obey=True, realtime=False, hold=10.0, room=2.0):
+    """A simulated robot with its own Eddy and a peer node on this machine (no discovery)."""
+    from eddy.brain import Safety
+    from eddy.link import PeerNode, attach
+    sim = SimAdapter(name=name, realtime=realtime, room=room)
+    eddy = Eddy(sim, Speaker("silent"), Safety(peer_hold=hold))
+    eddy.start()
+    node = PeerNode(name, key="k", host="127.0.0.1").start(discovery=False)
+    attach(node, eddy, obey=obey, start=start)
+    made.append(node)
+    return sim, eddy, node
+
+
+@pytest.fixture
+def made():
+    nodes = []
+    yield nodes
+    for node in nodes:
+        node.stop()
+
+
+def test_a_peer_can_be_added_by_address_alone(made):
+    """Where discovery is blocked, an address is enough: the robot is asked its name."""
+    _, _, a = _peer_robot("alpha", made)
+    sim_b, _, b = _peer_robot("bravo", made)
+    a.add_address("127.0.0.1", b.port)
+    assert a.wait_for("bravo", 5)
+    assert "Done" in a.request("bravo", "drive forward 20 cm") and abs(sim_b.x - 0.2) < 0.03
+
+
+def test_a_peer_added_by_address_is_found_once_it_starts(made):
+    """The other robot is switched on later: the address is tried again until it answers."""
+    import socket
+    _, _, a = _peer_robot("alpha", made)
+    with socket.socket() as s:              # find a free port for the robot that is not up yet
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    a.add_address("127.0.0.1", port)
+    assert not a.wait_for("late", 1)
+    from eddy.link import PeerNode
+    late = PeerNode("late", key="k", host="127.0.0.1", port=port).start(discovery=False)
+    made.append(late)
+    assert a.wait_for("late", 6)
+
+
+def test_a_peer_cannot_take_over_a_move_its_operator_asked_for(made):
+    """The robot's own operator comes first: while their command runs, a peer is turned away."""
+    import threading, time
+    _, _, a = _peer_robot("alpha", made)
+    sim_b, eddy_b, b = _peer_robot("bravo", made, realtime=True)
+    a.add_peer("bravo", "127.0.0.1", b.port)
+    own = threading.Thread(target=lambda: eddy_b.tell("drive forward 60 cm"))
+    own.start()
+    time.sleep(0.5)
+    answer = a.request("bravo", "turn left 90 degrees")
+    own.join(timeout=10)
+    assert "own operator" in answer
+    assert abs(sim_b.x - 0.6) < 0.04 and abs(sim_b.heading) < 0.05      # the operator's drive finished, untouched
+    assert "Done" in a.request("bravo", "drive forward 10 cm")          # and afterwards the peer is welcome
+
+
+def test_a_peer_can_still_stop_a_move_the_operator_asked_for(made):
+    """Stopping is always allowed, whoever started the move."""
+    import threading, time
+    _, _, a = _peer_robot("alpha", made)
+    sim_b, eddy_b, b = _peer_robot("bravo", made, realtime=True)
+    a.add_peer("bravo", "127.0.0.1", b.port)
+    own = threading.Thread(target=lambda: eddy_b.tell("drive forward 1.5 meters"))
+    own.start()
+    time.sleep(0.5)
+    assert "Stopped" in a.send("bravo", "stop")["message"]
+    own.join(timeout=5)
+    assert sim_b.x < 0.5 and sim_b.v == 0
+
+
+def test_a_peer_cannot_restart_a_robot_its_operator_just_stopped(made):
+    import time
+    _, _, a = _peer_robot("alpha", made)
+    sim_b, eddy_b, b = _peer_robot("bravo", made, hold=1.0)
+    a.add_peer("bravo", "127.0.0.1", b.port)
+    eddy_b.tell("stop")
+    assert "stopped it" in a.request("bravo", "drive forward 20 cm") and sim_b.x == 0.0
+    time.sleep(1.1)
+    assert "Done" in a.request("bravo", "drive forward 20 cm")
+    # A stop that came from a peer does not lock the peers out.
+    a.send("bravo", "stop")
+    assert "Done" in a.request("bravo", "drive forward 10 cm")
+
+
+def test_robots_started_from_a_shared_mark_report_positions_in_one_frame(made):
+    """Alpha starts on the mark facing along it; bravo starts 2 m further on, facing back.
+    After each drives, both positions are given from the mark, so the gap between them is right."""
+    from eddy.link import roll_call
+    sim_a, eddy_a, a = _peer_robot("alpha", made, start=(0.0, 0.0, 0.0))
+    sim_b, eddy_b, b = _peer_robot("bravo", made, start=(2.0, 0.0, 180.0))
+    a.add_peer("bravo", "127.0.0.1", b.port)
+    eddy_a.tell("drive forward 50 cm")
+    eddy_b.tell("drive forward 50 cm")
+    there = a.send("bravo", "state")
+    assert there["frame"] == "shared" and abs(there["x"] - 1.5) < 0.03 and abs(there["y"]) < 0.03
+    assert abs(abs(there["heading"]) - math.pi) < 0.05
+    line = roll_call(a)[0]              # "bravo: x 1.50, y 0.00 from the shared mark, 1.00 m from me"
+    assert line.endswith("m from me") and abs(float(line.split(", ")[-1].split()[0]) - 1.0) < 0.03
+    # A sideways move too: bravo turns left (now facing -y in the shared frame) and drives.
+    eddy_b.tell("turn left 90 degrees")
+    eddy_b.tell("drive forward 40 cm")
+    there = a.send("bravo", "state")
+    assert abs(there["x"] - 1.5) < 0.05 and abs(there["y"] + 0.4) < 0.05
+
+
+def test_without_a_shared_mark_positions_are_marked_as_the_robots_own(made):
+    from eddy.link import roll_call
+    _, _, a = _peer_robot("alpha", made)
+    _, _, b = _peer_robot("bravo", made)
+    a.add_peer("bravo", "127.0.0.1", b.port)
+    assert a.send("bravo", "state")["frame"] == "own"
+    assert "own frame" in roll_call(a)[0]
+
+
+def test_an_obstacle_is_reported_where_it_is_in_the_shared_frame(made):
+    """Bravo starts 5 m along and 5 m across from the mark and drives into its wall, which is
+    2 m ahead of it: the others are told about something near (7, 5), not near (2, 0)."""
+    import time
+    _, _, a = _peer_robot("alpha", made, start=(0.0, 0.0, 0.0))
+    sim_b, eddy_b, b = _peer_robot("bravo", made, start=(5.0, 5.0, 0.0))
+    b.add_peer("alpha", "127.0.0.1", a.port)
+    eddy_b.tell("drive forward 5 meters")
+    deadline = time.time() + 3
+    while time.time() < deadline and not a.inbox:
+        time.sleep(0.05)
+    sender, kind, body = a.inbox[0]
+    assert (sender, kind, body["what"], body["frame"]) == ("bravo", "event", "obstacle", "shared")
+    assert abs(body["x"] - 7.0) < 0.3 and abs(body["y"] - 5.0) < 0.05
+
+
+# ---- run log -----------------------------------------------------------------------
+
+def test_run_log_records_every_command_with_the_state_before_and_after(tmp_path):
+    from eddy import runlog
+    log = runlog.RunLog.open_for("log bot/1", str(tmp_path))
+    eddy = Eddy(SimAdapter(name="log-bot"), Speaker("silent"), log=log)
+    eddy.start()
+    eddy.tell("drive forward 50 cm")
+    eddy.tell("make me a sandwich", source="voice")
+    eddy.tell("turn left 90 degrees and reach 9 9 9")
+    eddy.stop()
+    eddy.close()
+    assert runlog.latest(str(tmp_path)) == log.path and "/" not in log.path[len(str(tmp_path)) + 1:]
+    entries = runlog.read(log.path)
+    assert entries[0]["event"] == "start" and entries[0]["robot"] == "log-bot" and "drive" in entries[0]["capabilities"]
+    drive, unknown, turn, reach = entries[1:5]
+    assert drive["said"] == "drive forward 50 cm" and drive["command"] == "Drive" and drive["ok"]
+    assert drive["before"]["x"] == 0.0 and abs(drive["after"]["x"] - 0.5) < 0.03 and drive["args"]["distance"] == 0.5
+    assert unknown["source"] == "voice" and unknown["command"] is None and not unknown["ok"]
+    assert turn["command"] == "Drive" and turn["ok"] and reach["command"] == "MoveTo" and not reach["ok"]
+    assert "beyond my reach" in reach["message"]
+    assert [e["command"] for e in entries[5:]] == ["Stop", "Stop"] and entries[5]["before"] is None
+
+
+def test_a_run_log_that_cannot_be_written_does_not_stop_the_robot(tmp_path):
+    from eddy import runlog
+    assert runlog.RunLog.open_for("x", str(tmp_path / "file" / "sub")) is not None
+    blocker = tmp_path / "blocked"
+    blocker.write_text("a file where the folder should be")
+    assert runlog.RunLog.open_for("x", str(blocker)) is None        # says so, returns nothing
+    log = runlog.RunLog.open_for("x", str(tmp_path))
+    log._file.close()                                               # the disk "fails" under it
+    sim = SimAdapter()
+    eddy = Eddy(sim, Speaker("silent"), log=log)
+    assert eddy.tell("drive forward 20 cm").ok and abs(sim.x - 0.2) < 0.03
+
+
+# ---- web page ----------------------------------------------------------------------
+
+JPEG = b"\xff\xd8\xff\xe0" + b"pretend picture" + b"\xff\xd9"
+
+
+@pytest.fixture
+def page():
+    """A live simulated robot with a (pretend) camera, and its web page on a local port."""
+    from eddy.web import WebPage
+    sim = SimAdapter(name="web-bot").go_live()
+    sim.camera_frame = lambda: JPEG
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    web = WebPage(eddy, host="127.0.0.1", port=0, code="c0de").start()
+    yield sim, eddy, web
+    web.stop()
+    sim.close()
+
+
+def _http(web, path, body=None, code="c0de"):
+    """GET (or POST when a body is given) a path on the page; returns (status, bytes)."""
+    import urllib.error, urllib.request
+    url = f"http://127.0.0.1:{web.port}{path}" + (f"?t={code}" if code is not None else "")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def test_web_page_shows_the_robot_and_drives_it(page):
+    import json, time
+    sim, eddy, web = page
+    status, html = _http(web, "/", code=None)
+    assert status == 200 and b"STOP" in html and b"c0de" not in html      # the page itself gives nothing away
+    state = json.loads(_http(web, "/state")[1])
+    assert state["name"] == "web-bot" and "drive" in state["capabilities"] and state["camera"] and state["x"] == 0.0
+    assert _http(web, "/tell", b"drive forward 20 cm")[0] == 202          # answered at once, carried out behind
+    deadline = time.time() + 6
+    while time.time() < deadline and not json.loads(_http(web, "/state")[1])["results"]:
+        time.sleep(0.1)
+    state = json.loads(_http(web, "/state")[1])
+    assert state["results"][-1]["ok"] and "moved 0.20 m" in state["results"][-1]["message"]
+    assert abs(sim.x - 0.2) < 0.03 and abs(state["x"] - 0.2) < 0.03
+
+
+def test_web_stop_button_stops_a_drive_in_progress(page):
+    import json, time
+    sim, eddy, web = page
+    _http(web, "/tell", b"drive forward 1.5 meters")
+    time.sleep(0.6)
+    assert sim.v > 0 and json.loads(_http(web, "/state")[1])["busy"]
+    status, body = _http(web, "/stop", b"")
+    assert status == 200 and "Stopped" in json.loads(body)["message"]
+    time.sleep(0.3)
+    assert sim.v == 0 and sim.x < 0.5
+
+
+def test_web_page_does_nothing_without_the_code(page):
+    sim, eddy, web = page
+    for code in (None, "", "wrong", "c0d"):
+        assert _http(web, "/state", code=code)[0] == 401
+        assert _http(web, "/camera.mjpg", code=code)[0] == 401
+        assert _http(web, "/tell", b"drive forward 1 meter", code=code)[0] == 401
+        assert _http(web, "/stop", b"", code=code)[0] == 401
+    assert sim.v == 0 and sim.x == 0
+    assert _http(web, "/tell", b"x" * 501)[0] == 413 and _http(web, "/tell", b"")[0] == 400
+    assert _http(web, "/nowhere")[0] == 404
+
+
+def test_web_page_streams_the_camera(page):
+    import urllib.request
+    sim, eddy, web = page
+    with urllib.request.urlopen(f"http://127.0.0.1:{web.port}/camera.mjpg?t=c0de", timeout=5) as r:
+        assert "multipart/x-mixed-replace" in r.headers["Content-Type"]
+        chunk = r.read(len(JPEG) + 80)
+    assert b"Content-Type: image/jpeg" in chunk and JPEG in chunk
+
+
+def test_web_page_says_why_there_is_no_picture():
+    import json
+    from eddy.web import WebPage
+    eddy = Eddy(SimAdapter(), Speaker("silent"))
+    eddy.start()
+    web = WebPage(eddy, host="127.0.0.1", port=0).start()
+    try:
+        assert len(web.code) >= 6 and web.links()[0].endswith(f":{web.port}/?t={web.code}")
+        state = json.loads(_http(web, "/state", code=web.code)[1])
+        assert state["camera"] is False and "no camera" in state["camera_note"]
+    finally:
+        web.stop()
+
+
+def test_camera_feeds_are_tried_in_a_sensible_order():
+    """Compressed colour first (already JPEG), raw colour next, depth last."""
+    img, comp = "sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"
+    profile = classify_graph([("/cam/depth/image_raw", [img]), ("/cam/rgb/image_raw", [img]),
+                              ("/cam/rgb/image_raw/compressed", [comp]), ("/cam/depth/image_raw/compressedDepth", [comp])])
+    assert [n for n, _ in profile["camera_feeds"]] == ["/cam/rgb/image_raw/compressed", "/cam/rgb/image_raw",
+                                                        "/cam/depth/image_raw/compressedDepth", "/cam/depth/image_raw"]
+
+
+def test_an_uncompressed_camera_picture_is_turned_into_jpeg():
+    """A raw picture (as most camera drivers publish) becomes a JPEG a browser can show,
+    with its colours the right way round."""
+    cv2 = pytest.importorskip("cv2")
+    from types import SimpleNamespace
+    from eddy.adapters.ros2 import Ros2Adapter
+    adapter = Ros2Adapter()
+    red = bytes([255, 0, 0]) * 16 * 16       # 16 x 16, every pixel red, in rgb8
+    adapter._on_image(SimpleNamespace(height=16, width=16, step=48, encoding="rgb8", data=red), "/cam")
+    assert adapter._jpeg[:2] == b"\xff\xd8"
+    blue, green, red_ = cv2.imdecode(np.frombuffer(adapter._jpeg, np.uint8), cv2.IMREAD_COLOR)[8, 8]
+    assert red_ > 200 and blue < 60 and green < 60
+    # A format Eddy does not convert is explained, not shown wrongly.
+    other = Ros2Adapter()
+    other._on_image(SimpleNamespace(height=2, width=2, step=4, encoding="16UC1", data=bytes(8)), "/depth")
+    assert other._jpeg is None and "16UC1" in other.camera_note
+    # A compressed picture that is not JPEG is explained too.
+    other._on_compressed(SimpleNamespace(format="png", data=b"\x89PNG...."), "/cam/compressed")
+    assert other._jpeg is None and "png" in other.camera_note

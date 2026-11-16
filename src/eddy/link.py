@@ -4,8 +4,12 @@ Discovery: every node announces itself about once a second on a multicast group
 (no router setup, no central server). Messages: one JSON line over TCP, answered
 with one JSON line.
 
+Where discovery does not work (many Wi-Fi networks block multicast), a peer is added by
+its address instead: the node asks it "who" are you, and files it under the name it answers.
+
 Message types
     ping    are you there
+    who     what is your name                  (the one message that need not name its recipient)
     state   what are you, where are you
     tell    please carry out this sentence     (only obeyed when the robot was started with --obey)
     stop    stop now                           (always honoured from a trusted peer)
@@ -24,6 +28,7 @@ import collections
 import hashlib
 import hmac
 import json
+import math
 import os
 import socket
 import socketserver
@@ -36,6 +41,7 @@ from typing import Callable, Dict, Optional
 # The multicast address and UDP port every Eddy announces itself on. 239.255.x.x is the
 # range reserved for use inside one local network.
 GROUP, BEACON_PORT = "239.255.42.99", 42424
+PEER_PORT = 42425      # the TCP port a robot takes messages on unless told otherwise (so peers can be given by address alone)
 MAX_SKEW = 30.0        # seconds a signed message stays valid
 
 
@@ -67,7 +73,9 @@ class PeerNode:
         self.peers: Dict[str, dict] = {}                    # name -> {host, port, caps, seen}
         self.inbox = collections.deque(maxlen=200)          # (sender, type, body)
         # Message type -> function that answers it. "ping" is built in; attach() adds the rest.
-        self.handlers: Dict[str, Callable[[str, object], object]] = {"ping": lambda sender, body: "pong"}
+        self.handlers: Dict[str, Callable[[str, object], object]] = {
+            "ping": lambda sender, body: "pong",
+            "who": lambda sender, body: {"name": self.name, "caps": self.capabilities}}
         self._nonces = collections.OrderedDict()            # nonces already seen, oldest first
         self._lock = threading.Lock()
         self._running = False
@@ -127,6 +135,22 @@ class PeerNode:
         Manual peers are never forgotten for being quiet. The name must be the one that robot
         runs under: commands are addressed by name, and a robot refuses one addressed to another."""
         self.peers[name] = {"host": host, "port": port, "caps": [], "seen": time.time(), "manual": True}
+
+    def add_address(self, host: str, port: int = PEER_PORT, patience: float = 600.0) -> None:
+        """Add a peer when only its address is known: ask it its name and file it under that.
+        The other robot may not be running yet, so this keeps asking in the background (every
+        2 s, for up to `patience` seconds) and returns at once."""
+        def ask():
+            deadline = time.time() + patience
+            while self._running and time.time() < deadline:
+                try:
+                    who = self._exchange(host, port, "who", None, to=None, timeout=3.0)
+                    self.peers[str(who["name"])] = {"host": host, "port": port, "caps": list(who.get("caps", [])),
+                                                    "seen": time.time(), "manual": True}
+                    return
+                except (PeerError, KeyError, TypeError):
+                    time.sleep(2.0)
+        threading.Thread(target=ask, daemon=True).start()
 
     # ---- discovery -----------------------------------------------------------
 
@@ -276,7 +300,7 @@ class PeerNode:
         kind, sender, body = str(msg["type"]), str(msg.get("from", "?")), msg.get("body")
         # A signed message is only good for the robot it names. Without this, a command recorded
         # on its way to one robot could be sent on to another that shares the key.
-        if trusted and msg.get("to") != self.name:
+        if trusted and kind != "who" and msg.get("to") != self.name:
             return {"ok": False, "error": f"refused: this message is addressed to '{msg.get('to')}', "
                                           f"and I am '{self.name}'"}
         # A robot without a key still answers harmless questions, but never moves for a stranger.
@@ -297,15 +321,19 @@ class PeerNode:
         target = self.peers.get(peer)
         if target is None:
             raise PeerError(f"no peer called '{peer}' (known: {', '.join(sorted(self.peers)) or 'none'})")
-        raw = (json.dumps(self._sign({"type": kind, "body": body}, to=peer)) + "\n").encode()
+        return self._exchange(target["host"], target["port"], kind, body, to=peer, timeout=timeout)
+
+    def _exchange(self, host: str, port: int, kind: str, body, to: Optional[str], timeout: float):
+        """Send one signed message to an address and return the reply body."""
+        raw = (json.dumps(self._sign({"type": kind, "body": body}, to=to)) + "\n").encode()
         try:
             # 5 s to connect; then up to `timeout` for the answer, since a command may take a while.
-            with socket.create_connection((target["host"], target["port"]), timeout=5) as sock:
+            with socket.create_connection((host, port), timeout=min(5.0, timeout)) as sock:
                 sock.settimeout(timeout)
                 sock.sendall(raw)
                 reply = json.loads(sock.makefile("rb").readline() or b"{}")
         except (OSError, ValueError) as exc:
-            raise PeerError(f"could not reach {peer}: {exc}") from exc
+            raise PeerError(f"could not reach {to or host}: {exc}") from exc
         if not reply.get("ok"):
             raise PeerError(reply.get("error", "no answer"))
         return reply.get("body")
@@ -329,26 +357,54 @@ class PeerNode:
         return out
 
 
-def attach(node: PeerNode, eddy, obey: bool = False) -> None:
-    """Connect a peer node to an Eddy: answer state queries, honour stop, optionally obey commands."""
+def attach(node: PeerNode, eddy, obey: bool = False, start=None) -> None:
+    """Connect a peer node to an Eddy: answer state queries, honour stop, optionally obey commands.
+
+    start: (x, y, heading in degrees) of this robot right now, measured from a mark on the floor
+    that every robot uses. With it, the positions robots tell each other are in one shared frame;
+    without it each robot reports positions in its own frame, which mean nothing to the others.
+    """
     node.capabilities = eddy.model.capabilities()
+    zero = eddy.adapter.state()         # where the robot's own odometry says it is right now
+
+    def place(x: float, y: float, heading: float):
+        """A pose from this robot's odometry, as (x, y, heading, frame) for telling other robots."""
+        if start is None:
+            return x, y, heading, "own"
+        turn = math.radians(start[2]) - zero.heading
+        dx, dy = x - zero.x, y - zero.y
+        facing = heading + turn
+        return (start[0] + dx * math.cos(turn) - dy * math.sin(turn),
+                start[1] + dx * math.sin(turn) + dy * math.cos(turn),
+                math.atan2(math.sin(facing), math.cos(facing)), "shared")
+
+    def where() -> dict:
+        """This robot's position, for other robots."""
+        s = eddy.adapter.state()
+        x, y, heading, frame = place(s.x, s.y, s.heading)
+        return {"x": x, "y": y, "heading": heading, "frame": frame, "known": s.has_odometry}
+    node.where = where
 
     def on_state(sender, body):
         """Answer "what are you and where are you"."""
         s = eddy.adapter.state()
-        return {"name": eddy.model.name, "capabilities": eddy.model.capabilities(), "x": s.x, "y": s.y,
-                "heading": s.heading, "range_ahead": s.range_ahead, "joints": s.joints}
+        return dict(where(), name=eddy.model.name, capabilities=eddy.model.capabilities(),
+                    range_ahead=s.range_ahead, joints=s.joints)
 
     def on_tell(sender, body):
-        """Carry out a sentence from a peer, but only if this robot was started with --obey."""
+        """Carry out a sentence from a peer, but only if this robot was started with --obey,
+        and never against its own operator."""
         if not obey:
             raise PeerError("this robot is not accepting commands from peers (start it with --obey)")
-        result = eddy.tell(str(body))
+        reason = eddy.peer_refusal()
+        if reason:
+            raise PeerError(f"not now: {reason}")
+        result = eddy.tell(str(body), source=f"peer:{sender}")
         return {"ok": result.ok, "message": result.message}
 
     def on_stop(sender, body):
         """Stop on a trusted peer's request, whether or not --obey was given."""
-        return {"message": eddy.stop().message}
+        return {"message": eddy.stop(f"peer:{sender}").message}
 
     def on_event(sender, body):
         """Remember what another robot reported."""
@@ -361,12 +417,38 @@ def attach(node: PeerNode, eddy, obey: bool = False) -> None:
 
     def announce(result) -> None:           # tell the others when something notable happens to me
         """Called after every command this robot finishes. If it met an obstacle, tell every
-        peer where, in a background thread so the robot is not held up by the network."""
+        peer where the obstacle is, in a background thread so the robot is not held up by the network."""
         if "in the way" in result.message:
             s = eddy.adapter.state()
-            body = {"what": "obstacle", "x": s.x, "y": s.y, "heading": s.heading}
+            # The obstacle is the range reading ahead of the robot (measured from the sensor, so
+            # it is out by the distance from the robot's centre to its sensor).
+            reach = s.range_ahead or 0.0
+            x, y, heading, frame = place(s.x + reach * math.cos(s.heading), s.y + reach * math.sin(s.heading), s.heading)
+            body = {"what": "obstacle", "x": x, "y": y, "heading": heading, "frame": frame}
             threading.Thread(target=node.broadcast, args=("event", body), daemon=True).start()
     eddy.listeners.append(announce)
+
+
+def roll_call(node: PeerNode) -> list:
+    """One line per known peer: where it is and, when both robots share a frame, how far away."""
+    me = node.where() if hasattr(node, "where") else None
+    lines = []
+    for peer in sorted(node.peers):
+        try:
+            s = node.send(peer, "state", timeout=3.0)
+        except PeerError as exc:
+            lines.append(f"{peer}: {exc}")
+            continue
+        if not s.get("known", True):
+            lines.append(f"{peer}: reports no position")
+        elif s.get("frame") != "shared":
+            lines.append(f"{peer}: x {s['x']:.2f}, y {s['y']:.2f} in its own frame (start it with --start to share one)")
+        elif me is None or me["frame"] != "shared":
+            lines.append(f"{peer}: x {s['x']:.2f}, y {s['y']:.2f} from the shared mark (give this robot --start to see the distance)")
+        else:
+            lines.append(f"{peer}: x {s['x']:.2f}, y {s['y']:.2f} from the shared mark, "
+                         f"{math.hypot(s['x'] - me['x'], s['y'] - me['y']):.2f} m from me")
+    return lines
 
 
 def selftest(check) -> None:

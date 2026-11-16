@@ -21,12 +21,31 @@ from .brain import Eddy, Safety
 from .senses.speak import Speaker
 
 
-def _eddy(args, speaker: str = "print") -> Eddy:
+def _eddy(args, speaker: str = "print", log: bool = False) -> Eddy:
     """Build an Eddy for the robot and safety options given on the command line.
     Not every sub-command has --speed and --min-range, hence the getattr defaults."""
     adapter = open_robot(args.robot, key=getattr(args, "key", None))
     safety = Safety(speed_scale=getattr(args, "speed", 1.0), min_range=getattr(args, "min_range", 0.25))
-    return Eddy(adapter, Speaker(speaker), safety)
+    # Every run is logged unless --no-log is given. The file is named after the time and the robot.
+    keep, log = log, None
+    if keep and not getattr(args, "no_log", True):
+        from .runlog import RunLog
+        log = RunLog.open_for(args.robot if args.robot != "auto" else "robot")
+    return Eddy(adapter, Speaker(speaker), safety, log=log)
+
+
+def _say_where_the_log_is(eddy: Eddy) -> None:
+    if eddy.log is not None:
+        print(f"Keeping a log of this run in {eddy.log.path}  (see it with: eddy log)", flush=True)
+
+
+def _start_mark(text):
+    """Turn "--start x,y,degrees" into three numbers."""
+    try:
+        x, y, heading = (float(v) for v in text.replace(",", " ").split())
+        return x, y, heading
+    except ValueError:
+        raise ValueError(f"--start needs three numbers: x,y,heading in degrees (got '{text}')") from None
 
 
 def cmd_scan(args) -> int:
@@ -48,7 +67,7 @@ def cmd_info(args) -> int:
 def cmd_do(args) -> int:
     """`eddy do "<sentence>" ...`: carry out each sentence in order, then exit."""
     ok = True
-    with _eddy(args, "auto" if args.speak else "print") as eddy:
+    with _eddy(args, "auto" if args.speak else "print", log=True) as eddy:
         for sentence in args.sentence:
             result = eddy.tell(sentence)
             print(f"> {sentence}\n  {result}")
@@ -58,8 +77,9 @@ def cmd_do(args) -> int:
 
 def cmd_shell(args) -> int:
     """`eddy shell`: an interactive prompt; each line typed is a command for the robot."""
-    with _eddy(args, "auto" if args.speak else "print") as eddy:
+    with _eddy(args, "auto" if args.speak else "print", log=True) as eddy:
         print(eddy.model.summary())
+        _say_where_the_log_is(eddy)
         print('\nType what you want the robot to do ("drive forward 1 meter", "turn left", "reach 0.2 0 0.3",\n'
               '"status", "stop"). Ctrl-D or "quit" to leave.\n')
         while True:
@@ -100,9 +120,10 @@ def cmd_serve(args) -> int:
 
 def cmd_run(args) -> int:
     """Everything on at once: the robot, plus whichever senses were asked for."""
-    eddy = _eddy(args, "auto" if args.speak else "print")
+    eddy = _eddy(args, "auto" if args.speak else "print", log=True)
     eddy.start()
     print(eddy.model.summary(), flush=True)
+    _say_where_the_log_is(eddy)
     # Print the outcome of every command, whichever sense it came from.
     eddy.listeners.append(lambda result: print(f"  {result}", flush=True))
     threads = []
@@ -135,7 +156,7 @@ def cmd_run(args) -> int:
                     eddy.speaker.say("I did not catch all of that.")
                 elif sentence:
                     print(f"[heard] {sentence}", flush=True)
-                    eddy.tell(sentence)
+                    eddy.tell(sentence, source="voice")
         background("voice", hear)
         print("Listening." + ("" if args.no_wake_word else ' Start each command with "Eddy".'), flush=True)
 
@@ -153,12 +174,38 @@ def cmd_run(args) -> int:
 
     # --peers: join the robot-to-robot link.
     node = None
-    if args.peers:
-        from .link import PeerNode, attach
-        node = PeerNode(args.name or eddy.model.name, key=args.key, port=args.peer_port).start()
-        attach(node, eddy, obey=args.obey)
+    if args.peers or args.peer or args.start:
+        from .link import PEER_PORT, PeerNode, attach, roll_call
+        name = args.name or eddy.model.name
+        try:
+            node = PeerNode(name, key=args.key, port=args.peer_port)
+        except OSError:
+            # The usual port is taken (a second robot on this machine): take any free one.
+            node = PeerNode(name, key=args.key, port=0)
+        node.start()
+        attach(node, eddy, obey=args.obey, start=_start_mark(args.start) if args.start else None)
         print(f"Peer link up as '{node.name}' on port {node.port}"
               f"{' (will obey signed commands from peers)' if args.obey else ''}.", flush=True)
+        if not args.key:
+            print("No --key given: peers can see this robot but none can command or stop it, "
+                  "and it cannot command them.", flush=True)
+        # Peers given by address, for networks where robots cannot find each other by themselves.
+        for address in args.peer:
+            host, _, port = address.partition(":")
+            node.add_address(host, int(port or PEER_PORT))
+            print(f"Looking for a peer at {host}:{port or PEER_PORT}.", flush=True)
+
+    # --web: a page with the camera, a command box and a stop button.
+    page = None
+    if args.web:
+        from .web import WebPage
+        # The simulator normally jumps its clock forward; watched on a page it must move in real time.
+        if hasattr(eddy.adapter, "go_live"):
+            eddy.adapter.go_live()
+        page = WebPage(eddy, port=args.web_port).start()
+        print("Web page up. Open this on a laptop or phone on the same network:", flush=True)
+        for link in page.links():
+            print(f"  {link}", flush=True)
 
     if args.say:
         eddy.speaker.say(args.say)
@@ -170,11 +217,18 @@ def cmd_run(args) -> int:
                 line = input("eddy> ").strip()
                 if line in ("quit", "exit"):
                     break
-                if line.startswith("@") and node is not None:      # "@other-robot turn left"
+                if line.startswith("@") and node is not None:      # "@other-robot turn left", "@all stop"
                     peer, _, sentence = line[1:].partition(" ")
-                    print(node.request(peer, sentence))
+                    if peer != "all":
+                        print(node.request(peer, sentence))
+                    elif sentence.strip() in ("stop", "halt", "freeze"):
+                        for name, answer in node.broadcast("stop").items():
+                            print(f"{name}: {answer if isinstance(answer, Exception) else answer['message']}")
+                    else:
+                        for name in sorted(node.peers):
+                            print(node.request(name, sentence))
                 elif line == "peers" and node is not None:
-                    print(", ".join(sorted(node.peers)) or "no peers seen yet")
+                    print("\n".join(roll_call(node)) or "no peers seen yet")
                 elif line:
                     eddy.tell(line)
         else:
@@ -186,6 +240,8 @@ def cmd_run(args) -> int:
         # Always leave the network and stop the robot on the way out.
         if node is not None:
             node.stop()
+        if page is not None:
+            page.stop()
         eddy.close()
     return 0
 
@@ -201,8 +257,8 @@ def cmd_hear(args) -> int:
     if unclear:
         print("  part of that was not caught, so it was not acted on")
         return 1
-    with _eddy(args) as eddy:
-        result = eddy.tell(text)
+    with _eddy(args, log=True) as eddy:
+        result = eddy.tell(text, source="voice")
         print(f"  {result}")
     return 0 if result.ok else 1
 
@@ -274,6 +330,31 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def cmd_log(args) -> int:
+    """`eddy log`: show what happened in the latest run (or the run log file given)."""
+    from . import runlog
+    path = args.file or runlog.latest()
+    if not path:
+        print(f"No run logs yet in {runlog.default_dir()}. Runs of `eddy do`, `shell` and `run` are logged there.")
+        return 1
+    entries = runlog.read(path)
+    print(path)
+    for e in entries:
+        if e.get("event") == "start":
+            print(f"{e['at']}  attached to {e.get('robot')} ({', '.join(e.get('capabilities', []))})")
+        elif e.get("event") == "command":
+            where = ""
+            after = e.get("after") or {}
+            if after.get("has_odometry"):
+                where = f"  [x {after['x']:.2f}, y {after['y']:.2f}]"
+            said = e.get("said") or e.get("command")
+            print(f"{e['at']}  {e.get('source', '?'):<8} {'ok  ' if e.get('ok') else 'FAIL'} {said}  ->  {e.get('message')}{where}")
+    commands = [e for e in entries if e.get("event") == "command"]
+    print(f"\n{len(commands)} command(s), {sum(1 for e in commands if not e.get('ok'))} not carried out. "
+          "The file has the full state before and after each one.")
+    return 0
+
+
 def cmd_selftest(args) -> int:
     """`eddy selftest`: run the end-to-end checks on the simulator."""
     from .selftest import run
@@ -294,6 +375,7 @@ def main(argv=None) -> int:
         p.add_argument("--min-range", type=float, default=0.25, help="stop this far (m) from obstacles ahead")
         p.add_argument("--key", default=os.environ.get("EDDY_KEY"),
                        help="shared secret: for a tcp: robot served with one, for `serve`, and for --peers")
+        p.add_argument("--no-log", action="store_true", help="do not keep a log of this run")
 
     # One parser per sub-command; set_defaults(fn=...) records which function runs it.
     sub.add_parser("doctor", help="check what works on this machine").set_defaults(fn=cmd_doctor)
@@ -310,20 +392,34 @@ def main(argv=None) -> int:
     robot_arg(p)
     p.add_argument("--speak", action="store_true")
     p.set_defaults(fn=cmd_shell)
-    p = sub.add_parser("run", help="run Eddy with senses (voice, hand signs, peers)")
-    robot_arg(p)
-    p.add_argument("--speak", action="store_true", help="speak out loud")
-    p.add_argument("--say", help="say this once at start-up")
-    p.add_argument("--voice", action="store_true", help="listen for spoken commands")
-    p.add_argument("--voice-model", help="folder of a Vosk speech model")
-    p.add_argument("--no-wake-word", action="store_true", help='act on every sentence, not only ones starting "Eddy"')
-    p.add_argument("--gestures", action="store_true", help="watch the camera for hand signs")
-    p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--peers", action="store_true", help="find and talk to other Eddy robots on the network")
-    p.add_argument("--name", help="this robot's name on the peer link")
-    p.add_argument("--peer-port", type=int, default=0)
-    p.add_argument("--obey", action="store_true", help="carry out commands sent by peers that know the key")
+    def run_args(p):
+        """The options of `eddy run` (also used by `eddy web`, which is `run` with the page on)."""
+        robot_arg(p)
+        p.add_argument("--speak", action="store_true", help="speak out loud")
+        p.add_argument("--say", help="say this once at start-up")
+        p.add_argument("--voice", action="store_true", help="listen for spoken commands")
+        p.add_argument("--voice-model", help="folder of a Vosk speech model")
+        p.add_argument("--no-wake-word", action="store_true", help='act on every sentence, not only ones starting "Eddy"')
+        p.add_argument("--gestures", action="store_true", help="watch the camera for hand signs")
+        p.add_argument("--camera", type=int, default=0)
+        p.add_argument("--peers", action="store_true", help="find and talk to other Eddy robots on the network")
+        p.add_argument("--name", help="this robot's name on the peer link")
+        p.add_argument("--peer", action="append", default=[], metavar="HOST[:PORT]",
+                       help="another Eddy robot's address, where robots do not find each other by themselves (repeatable)")
+        p.add_argument("--start", metavar="X,Y,DEGREES",
+                       help="where this robot is now, measured from a floor mark all the robots share, "
+                            "so they can tell each other where things are (e.g. --start 2,0,180)")
+        p.add_argument("--peer-port", type=int, default=42425, help="port for messages from peers")
+        p.add_argument("--obey", action="store_true", help="carry out commands sent by peers that know the key")
+        p.add_argument("--web", action="store_true", help="serve a web page: camera, commands and a stop button")
+        p.add_argument("--web-port", type=int, default=8080)
+
+    p = sub.add_parser("run", help="run Eddy with senses (voice, hand signs, peers, web page)")
+    run_args(p)
     p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("web", help="control the robot from a web page (camera, commands, stop button)")
+    run_args(p)
+    p.set_defaults(fn=cmd_run, web=True)
     p = sub.add_parser("serve", help="put a robot on the network (Eddy line protocol over TCP)")
     robot_arg(p)
     p.add_argument("--port", type=int, default=9000)
@@ -338,6 +434,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("see", help="name the hand sign in image files (tests hand signs without a camera)")
     p.add_argument("image", nargs="+")
     p.set_defaults(fn=cmd_see)
+    p = sub.add_parser("log", help="show what happened in the latest run")
+    p.add_argument("file", nargs="?", help="a run log file (default: the newest)")
+    p.set_defaults(fn=cmd_log)
     p = sub.add_parser("selftest", help="check the whole stack end to end on the simulator")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_selftest)

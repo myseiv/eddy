@@ -7,7 +7,7 @@ robot code directly, only to an adapter.
 from __future__ import annotations
 
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 from ..model import RobotModel, RobotState, Unsupported
 
@@ -41,6 +41,13 @@ class Adapter:
     def set_gripper(self, opening: float) -> None:
         """Set the gripper: 0 is closed, 1 is fully open."""
         raise Unsupported("this robot has no gripper")
+
+    # Why there is no camera picture, for adapters that have none (shown on the web page).
+    camera_note = "Eddy cannot read a camera on this kind of robot."
+
+    def camera_frame(self) -> Optional[bytes]:
+        """The camera's latest picture as JPEG bytes, or None if there is none (yet)."""
+        return None
 
     def stop(self) -> None:
         """Must always be safe to call, in any state."""

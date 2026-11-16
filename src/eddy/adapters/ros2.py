@@ -128,6 +128,14 @@ def classify_graph(topics: Iterable[Tuple[str, Sequence[str]]],
     # Grippers that take a single "go to this opening" command instead of a trajectory.
     profile["gripper_commands"] = sorted(n for n, types in (actions or []) if GRIP in types)
     profile["cameras"] = sorted(n for t in IMAGES for n in by_type.get(t, []))
+    # The order Eddy tries them in for a picture to show: compressed ones first (they are already
+    # JPEG, so nothing has to be converted), colour before depth, published before silent.
+    def camera_rank(item):
+        name, kind = item
+        low = name.lower()
+        return (pub_counts.get(name, 1) == 0, any(w in low for w in ("depth", "disparity", "/ir", "infra", "theora")),
+                kind != IMAGES[1], len(name), name)
+    profile["camera_feeds"] = sorted(((n, t) for t in IMAGES for n in by_type.get(t, [])), key=camera_rank)
     # The URDF is published as a String on a topic called robot_description.
     descriptions = [n for n in by_type.get(STRING, []) if n.rsplit("/", 1)[-1] == "robot_description"]
     if descriptions:
@@ -330,6 +338,12 @@ class Ros2Adapter(Adapter):
         self._limits: Dict[str, Tuple[float, float, str]] = {}
         self._mimics: Dict[str, str] = {}       # joints that only follow another joint
         self._we_started_rclpy = False
+        self._jpeg: Optional[bytes] = None        # the camera's latest picture
+        self._camera_sub = None                   # the camera subscription, made the first time a picture is asked for
+        self._camera_try = 0                      # which of the robot's camera feeds is being tried
+        self._camera_since = 0.0                  # when that feed was subscribed to
+        self._camera_encoded = 0.0                # when a raw picture was last converted to JPEG
+        self.camera_note = "This robot has no camera topic."
 
     # ---- connection ----------------------------------------------------------
 
@@ -695,6 +709,70 @@ class Ros2Adapter(Adapter):
             self._urdf = msg.data
 
     # ---- commands ------------------------------------------------------------
+
+    # ---- camera --------------------------------------------------------------
+
+    def camera_frame(self) -> Optional[bytes]:
+        """The camera's latest picture as JPEG bytes, or None if none has arrived.
+
+        Nothing is subscribed to until a picture is first asked for, so a camera costs nothing
+        unless someone is looking. If the feed tried delivers nothing in 3 s, the next is tried.
+        """
+        feeds = self.profile.get("camera_feeds") or []
+        if not feeds or self.node is None:
+            return None
+        now = time.monotonic()
+        if self._camera_sub is None or (self._jpeg is None and now - self._camera_since > 3.0 and len(feeds) > 1):
+            if self._camera_sub is not None:
+                self.node.destroy_subscription(self._camera_sub)
+                self._camera_try = (self._camera_try + 1) % len(feeds)
+            self._subscribe_camera(*feeds[self._camera_try])
+            self._camera_since = now
+        return self._jpeg
+
+    def _subscribe_camera(self, topic: str, kind: str) -> None:
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import CompressedImage, Image
+        self.camera_note = f"Waiting for a picture on {topic}."
+        if kind == IMAGES[1]:
+            self._camera_sub = self.node.create_subscription(
+                CompressedImage, topic, lambda msg: self._on_compressed(msg, topic), qos_profile_sensor_data)
+        else:
+            self._camera_sub = self.node.create_subscription(
+                Image, topic, lambda msg: self._on_image(msg, topic), qos_profile_sensor_data)
+
+    def _on_compressed(self, msg, topic: str) -> None:
+        """A compressed picture: JPEG ones are passed on as they are."""
+        data = bytes(msg.data)
+        if data[:2] == b"\xff\xd8":            # every JPEG file starts with these two bytes
+            self._jpeg = data
+        else:
+            self.camera_note = f"{topic} is compressed as '{msg.format}', which the page cannot show (it needs JPEG)."
+
+    def _on_image(self, msg, topic: str) -> None:
+        """An uncompressed picture: converted to JPEG with OpenCV, if the robot has it."""
+        now = time.monotonic()
+        if now - self._camera_encoded < 0.1:    # ten pictures a second is plenty, and converting costs CPU
+            return
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.camera_note = (f"{topic} is uncompressed, and turning it into pictures a browser can show needs "
+                                "OpenCV on the robot (python3-opencv). A compressed camera topic needs nothing.")
+            return
+        channels = {"rgb8": 3, "bgr8": 3, "mono8": 1, "rgba8": 4, "bgra8": 4}.get(msg.encoding)
+        if channels is None:
+            self.camera_note = f"{topic} uses the picture format '{msg.encoding}', which Eddy does not convert."
+            return
+        picture = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(msg.height, msg.step)[:, :msg.width * channels]
+        picture = picture.reshape(msg.height, msg.width, channels)
+        if msg.encoding.startswith("rgb"):
+            picture = picture[:, :, [2, 1, 0] + ([3] if channels == 4 else [])]    # OpenCV wants blue first
+        ok, jpeg = cv2.imencode(".jpg", np.ascontiguousarray(picture[:, :, :3] if channels == 4 else picture),
+                                [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            self._jpeg, self._camera_encoded = jpeg.tobytes(), now
 
     def state(self) -> RobotState:
         """A copy of the latest state, so the caller's copy cannot change under it."""

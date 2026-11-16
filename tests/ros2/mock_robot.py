@@ -17,7 +17,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from sensor_msgs.msg import JointState, LaserScan
+from sensor_msgs.msg import CompressedImage, Image, JointState, LaserScan
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory
 
@@ -67,6 +67,11 @@ class Base(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.description = self.create_publisher(String, "/robot_description", latched)
         self.description.publish(String(data=URDF))
+        # A camera, the way camera drivers publish one: raw colour, raw depth, and compressed colour.
+        self.image = self.create_publisher(Image, "/camera/color/image_raw", qos_profile_sensor_data)
+        self.depth = self.create_publisher(Image, "/camera/depth/image_raw", qos_profile_sensor_data)
+        self.jpeg = self.create_publisher(CompressedImage, "/camera/color/image_raw/compressed", qos_profile_sensor_data)
+        self.frames = 0
         self.create_timer(0.05, self.tick)      # publish sensors 20 times a second
 
     def on_fault(self, msg: String):
@@ -96,6 +101,13 @@ class Base(Node):
     def tick(self):
         """Publish one round of odometry, laser scan and joint states."""
         s = self.sim
+        # Camera: a 4 x 2 picture. The compressed one is a JPEG header with a frame counter (it is
+        # only ever checked for arriving intact, not looked at).
+        self.frames += 1
+        self.image.publish(Image(height=2, width=4, encoding="rgb8", step=12, data=[255, 0, 0] * 8))
+        self.depth.publish(Image(height=2, width=4, encoding="16UC1", step=8, data=[0] * 16))
+        self.jpeg.publish(CompressedImage(format="rgb8; jpeg compressed bgr8",
+                                          data=b"\xff\xd8\xff\xe0mock frame %06d\xff\xd9" % self.frames))
         if time.monotonic() - self.last_cmd > 0.5 and (s.v or s.w):
             s.set_velocity(0.0, 0.0)                    # command timeout, like real bases have
         now = self.get_clock().now().to_msg()

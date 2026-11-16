@@ -7,12 +7,14 @@ one in progress, and Stop always wins.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from . import gestures, intents
+from . import gestures, intents, runlog
 from .adapters.base import Adapter
 from .model import (Climb, Drive, Gripper, Home, Land, MoveBy, MoveTo, TakeOff, Refused, Report, RobotModel, Say, SetJoints, Stop,
                     Unsupported, Wander)
@@ -26,6 +28,7 @@ class Safety:
     max_drive_seconds: float = 30.0  # no single drive command runs longer than this
     speed_scale: float = 1.0         # turn everything down with one number
     tick: float = 0.05               # how often commands are re-sent and sensors re-checked
+    peer_hold: float = 10.0          # after the robot's own operator says stop, seconds it ignores commands from peers
 
 
 @dataclass
@@ -56,8 +59,13 @@ def _wrap(a: float) -> float:
 class Eddy:
     """The controller. Give it an adapter (a robot), then call tell(), sign() or execute()."""
 
-    def __init__(self, adapter: Adapter, speaker: Optional[Speaker] = None, safety: Optional[Safety] = None):
+    def __init__(self, adapter: Adapter, speaker: Optional[Speaker] = None, safety: Optional[Safety] = None,
+                 log: Optional[runlog.RunLog] = None):
+        """log: a run log to record every command in (see eddy.runlog), or None to keep none."""
         self.adapter = adapter
+        self.log = log
+        self._doing: Optional[str] = None     # who asked for the motion now running (None: nothing running)
+        self._own_stop = float("-inf")        # when the robot's own operator last said stop
         self.speaker = speaker or Speaker("print")
         self.safety = safety or Safety()
         self.model: Optional[RobotModel] = None     # filled in by start()
@@ -72,12 +80,17 @@ class Eddy:
     def start(self) -> RobotModel:
         """Connect to the robot and learn what it can do."""
         self.model = self.adapter.connect()
+        if self.log is not None:
+            self.log.write("start", robot=self.model.name, kind=self.model.kind,
+                           capabilities=self.model.capabilities(), details=self.model.details)
         return self.model
 
     def close(self) -> None:
         """Stop the robot and disconnect."""
         self.stop()
         self.adapter.close()
+        if self.log is not None:
+            self.log.close()
 
     # Support `with Eddy(adapter) as eddy:` so the robot is always stopped and released.
     def __enter__(self) -> "Eddy":
@@ -89,18 +102,23 @@ class Eddy:
 
     # ---- entry points --------------------------------------------------------
 
-    def tell(self, text: str) -> Result:
-        """Carry out a sentence."""
+    def tell(self, text: str, source: str = "typed") -> Result:
+        """Carry out a sentence. source says where it came from ("typed", "voice", "web",
+        "peer:<name>"): it is kept in the run log, and a peer's commands give way to the
+        robot's own operator."""
         commands = intents.parse_all(text)
         if not commands:
-            return self._finish(Result(False, f"I don't know how to \"{text.strip()}\"."))
+            result = Result(False, f"I don't know how to \"{text.strip()}\".")
+            if self.log is not None:
+                self.log.write("command", source=source, said=text, command=None, ok=False, message=result.message)
+            return self._finish(result)
         if len(commands) == 1:
-            return self.execute(commands[0])
+            return self.execute(commands[0], source, text)
         # Several commands in one sentence ("turn left and go forward 50 cm"): run them in
         # order, and do not carry on past one that failed or was interrupted.
         results = []
         for command in commands:
-            results.append(self.execute(command))
+            results.append(self.execute(command, source, text))
             if not results[-1].ok or results[-1].message.startswith(("Interrupted", "Stopped early")):
                 break
         message = " Then: ".join(r.message for r in results)
@@ -116,18 +134,55 @@ class Eddy:
         command = gestures.to_command(gesture)
         if command is None:
             return None
-        result = self.execute(command)
+        result = self.execute(command, "sign", gesture)
         result.message = f"[{gesture}] {result.message}"
         return result
 
-    def stop(self) -> Result:
+    def stop(self, source: str = "program") -> Result:
         """Stop the robot now."""
-        return self.execute(Stop())
+        return self.execute(Stop(), source)
 
-    def execute(self, command) -> Result:
-        """Carry out one command. Never raises for an unsupported or unsafe command."""
+    def peer_refusal(self) -> Optional[str]:
+        """Why a command from another robot may not be carried out right now, or None if it may.
+        The robot's own operator comes first: a peer cannot take over a move the operator
+        asked for, and cannot restart the robot straight after the operator stopped it."""
+        doing = self._doing
+        if doing is not None and not doing.startswith("peer"):
+            return "it is busy with a command from its own operator"
+        wait = self.safety.peer_hold - (time.monotonic() - self._own_stop)
+        if wait > 0:
+            return f"its own operator stopped it; it takes no commands from peers for another {wait:.0f} s"
+        return None
+
+    def execute(self, command, source: str = "program", said: Optional[str] = None) -> Result:
+        """Carry out one command. Never raises for an unsupported or unsafe command.
+        source: who asked (see tell). said: the sentence or sign it came from, for the run log."""
         if self.model is None:
             self.start()
+        if isinstance(command, Stop) and not source.startswith("peer"):
+            self._own_stop = time.monotonic()
+        if self.log is None:
+            return self._execute(command, source)
+        # Keep a record: where the robot was, what was asked, what happened, where it ended up.
+        # (No reading before a stop: nothing may delay a stop.)
+        before = None if isinstance(command, Stop) else self._snapshot()
+        began = time.monotonic()
+        result = self._execute(command, source)
+        self.log.write("command", source=source, said=said, command=type(command).__name__,
+                       args=dataclasses.asdict(command) if dataclasses.is_dataclass(command) else None,
+                       ok=result.ok, message=result.message, seconds=round(time.monotonic() - began, 3),
+                       before=before, after=self._snapshot())
+        return result
+
+    def _snapshot(self) -> Optional[dict]:
+        """The robot's state for the run log, or None if it cannot be read just now."""
+        try:
+            return runlog.snapshot(self.adapter.state())
+        except Exception:
+            return None
+
+    def _execute(self, command, source: str) -> Result:
+        """Carry out one command (see execute)."""
         # Take a new epoch number. Any motion still running holds an older number, sees the
         # change on its next tick and gives way. Say and Report do not move the robot, so
         # they leave a running motion alone.
@@ -152,7 +207,11 @@ class Eddy:
                 with self._motion:
                     if self._epoch != mine:
                         return self._finish(Result(False, "Cancelled before it started.", command))
-                    message = self._move(command, mine)
+                    self._doing = source
+                    try:
+                        message = self._move(command, mine)
+                    finally:
+                        self._doing = None
             return self._finish(Result(True, message, command))
         except (Unsupported, Refused) as exc:
             # Expected "no": the robot lacks the ability, or the command is unsafe.
