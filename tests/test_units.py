@@ -1168,3 +1168,67 @@ def test_half_a_meter_is_half_a_meter():
     assert [c.distance for c in intents.parse_all("drive forward one and a half meters")] == [1.5]
     assert [c.distance for c in intents.parse_all("go back two and a half meters")] == [2.5]
     assert intents.parse("drive forward half meter").distance == 0.5
+
+
+# ---- a turn that jams part of the way ----------------------------------------------
+
+class SlippingTurnSim(SimAdapter):
+    """A robot whose wheels slip while it turns: its odometry counts the whole turn, but the
+    body (and so the laser's view of the room) turns only `grip` of it. `noise` degrees are
+    added to the laser's reading, as a real laser's would wander."""
+
+    def __init__(self, grip: float, noise: float = 0.0):
+        super().__init__()
+        self.grip, self.noise = grip, math.radians(noise)
+        self._last, self._body = 0.0, 0.0
+
+    def state(self):
+        s = super().state()
+        step = math.atan2(math.sin(s.heading - self._last), math.cos(s.heading - self._last))
+        self._last = s.heading
+        self._body += self.grip * step
+        s.scan_turn = self._body + (self.noise if self._body else 0.0)
+        return s
+
+
+def _turn(grip, sentence, noise=0.0):
+    sim = SlippingTurnSim(grip, noise)
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    return eddy.tell(sentence), eddy
+
+
+def test_a_turn_the_laser_agrees_with_is_done():
+    r, eddy = _turn(1.0, "turn left 90 degrees")
+    assert r.ok and abs(eddy.turn_check["laser"] / eddy.turn_check["odometry"] - 1) < 0.02
+    assert _turn(1.0, "turn around")[0].ok
+
+
+def test_a_turn_that_fell_a_fifth_short_is_reported_as_jammed():
+    """Seen in Gazebo: 174 degrees by odometry, 138 true, and Eddy said "done". The laser saw it."""
+    r, eddy = _turn(0.79, "turn around")
+    assert not r.ok and "did not turn that far" in r.message and "jammed" in r.message
+    r, _ = _turn(0.79, "turn left 90 degrees")
+    assert not r.ok and "jammed" in r.message
+    assert not _turn(0.6, "turn around")[0].ok              # the cases already caught still are
+
+
+def test_a_laser_that_wanders_a_few_degrees_does_not_raise_a_false_alarm():
+    """The laser's reading of a good turn was within 10 degrees of the truth in Gazebo. Small
+    disagreements must not be called a jam, least of all on small turns."""
+    for noise in (-10, -6, 6, 10):
+        for sentence in ("turn left 30 degrees", "turn right 45 degrees", "turn left 90 degrees", "turn around"):
+            r, _ = _turn(1.0, sentence, noise)
+            assert r.ok, (noise, sentence, r.message)
+    assert _turn(0.8, "turn left 45 degrees")[0].ok         # 9 degrees short: within what a laser can be out by
+    assert _turn(0.93, "turn around")[0].ok                 # 12 degrees short of 180: not enough to call
+
+
+def test_a_turn_the_laser_only_partly_confirms_is_reported_with_the_doubt():
+    """Between "agrees" and "jammed": the turn is not refused, but Eddy says what the laser saw."""
+    r, _ = _turn(0.9, "turn around")                        # 18 degrees short of 180
+    assert r.ok and "laser saw only about 16" in r.message and "may have turned less" in r.message
+    r, _ = _turn(1.0, "turn around")
+    assert r.ok and "laser" not in r.message                # nothing to add when they agree
+    r, _ = _turn(0.97, "turn left 90 degrees")
+    assert r.ok and "laser" not in r.message

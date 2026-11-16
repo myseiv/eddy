@@ -19,6 +19,7 @@ for what in "${@:-panda diff two car steer drone}"; do for one in $what; do
     car)   cmd='bash /eddy/tests/sims/gz_up.sh ackermann_steering plain; python3 /eddy/tests/sims/check_gazebo.py ackermann_steering vehicle_blue ros2' ;;
     steer) cmd='bash /eddy/tests/sims/gz_up.sh ackermann_steering steering; python3 /eddy/tests/sims/check_gazebo.py ackermann_steering vehicle_blue ros2' ;;
     drone) cmd='bash /eddy/tests/sims/gz_up.sh multicopter_velocity_control drone; python3 /eddy/tests/sims/check_drone.py' ;;
+    measure) cmd='bash /eddy/tests/sims/gz_up.sh diff_drive plain; python3 /eddy/tests/sims/measure_turns.py' ;;
     *) echo "unknown test: $one"; exit 2 ;;
   esac
   echo "=================== $one ==================="

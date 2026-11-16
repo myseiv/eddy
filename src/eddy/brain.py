@@ -49,6 +49,8 @@ FLYING = "flying"   # DriveSpec.kind of a robot found to change height on comman
 CLIMB = 0.3         # m/s: climb and descent speed
 BLIND = 1.0         # seconds without a range reading after which the last one is not trusted
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
+SHORT = math.radians(12)    # a laser can be this far out on a good turn, so less than this is not a jam
+AGREE = 0.85        # the share of the odometry's turn the laser must confirm
 SIDE = 1.0          # metres: the most Eddy slides sideways in one command, since it cannot see to the side
 
 
@@ -67,6 +69,7 @@ class Eddy:
         self.log = log
         self._doing: Optional[str] = None     # who asked for the motion now running (None: nothing running)
         self._own_stop = float("-inf")        # when the robot's own operator last said stop
+        self.turn_check: Optional[dict] = None    # the last turn as the odometry and the laser each saw it (radians)
         self.speaker = speaker or Speaker("print")
         self.safety = safety or Safety()
         self.model: Optional[RobotModel] = None     # filled in by start()
@@ -521,7 +524,12 @@ class Eddy:
         if (cmd.angle is not None and not arc and start.scan_turn is not None and end.scan_turn is not None
                 and (end.range_age is None or end.range_age <= BLIND)):
             seen_turn = abs(end.scan_turn - start.scan_turn)
-            if why == "done" and turned >= math.radians(20) and seen_turn < 0.7 * turned:
+            self.turn_check = {"odometry": turned, "laser": seen_turn}
+            # Jammed means the laser saw clearly less turn than the odometry claims: at least
+            # SHORT less, and under AGREE of it. Both numbers come from measuring in Gazebo
+            # (tests/sims/measure_turns.py): on good turns the laser was within 10 degrees and
+            # 5 percent of the truth; a turn that jammed part of the way came out at 79 percent.
+            if why == "done" and turned - seen_turn > SHORT and seen_turn < AGREE * turned:
                 why = "jammed"
         if why == "jammed":
             really = f" (about {math.degrees(seen_turn):.0f} degrees by the laser)" if seen_turn is not None else ""
@@ -550,6 +558,12 @@ class Eddy:
         # A robot that is slow to respond (a drone, a heavy base, slow odometry) ends a turn on
         # the spot past the angle asked for. Turn back the difference once, slowly.
         over = turned - goal if (trim and cmd.angle is not None and odometry and not arc) else 0.0
+        # Not short enough to call a jam, but the laser saw clearly less than the odometry: say so,
+        # so the figure reported is not taken as certain.
+        doubt = ""
+        if seen_turn is not None and turned - seen_turn > SHORT:
+            doubt = (f" The laser saw only about {math.degrees(seen_turn):.0f} degrees, so the robot may have "
+                     "turned less than its odometry says.")
         if over > math.radians(4) and self._epoch == mine:
             before = self.adapter.state().heading
             try:
@@ -558,7 +572,7 @@ class Eddy:
                 pass            # the correction could not be made: report what the turn really was
             turned -= abs(_wrap(self.adapter.state().heading - before))
             what = f"turned {math.degrees(turned):.0f} degrees"
-        return f"Done: {what}."
+        return f"Done: {what}.{doubt}"
 
     def _slide(self, cmd: Slide, mine: int) -> str:
         """Move sideways by a distance without turning, measured by the robot's own position.
