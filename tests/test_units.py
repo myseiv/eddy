@@ -1232,3 +1232,49 @@ def test_a_turn_the_laser_only_partly_confirms_is_reported_with_the_doubt():
     assert r.ok and "laser" not in r.message                # nothing to add when they agree
     r, _ = _turn(0.97, "turn left 90 degrees")
     assert r.ok and "laser" not in r.message
+
+
+# ---- amounts a command cannot use are never dropped (found on the real car, 2026-11-17) ----
+
+def test_amounts_a_command_cannot_use_are_not_dropped():
+    """On the real robot "turn left 30cm" turned 90 degrees and ignored the 30 cm, and "go back
+    80 degees for 20 cm" drove back 20 cm and ignored the 80. Half-used sentences are refused."""
+    for t in ("turn left 10cm", "turn left 30cm", "turn right 50 cm", "go back 80 degees for 20 cm",
+              "go back 80 degrees for 20 cm", "turn right 20 degrees for 20cm", "drive forward 1 meter for 5 seconds",
+              "turn left 90 degrees for 3 seconds", "slide left 20 cm for 5 seconds", "slide left 30 degrees",
+              "come forward and turn right 50cm", "go backward and turn left 50cm", "turn left one-eighty",
+              "drive forward 2 meters 3"):
+        assert intents.parse_all(t) == [], t
+    # Sentences whose amounts are all used still work.
+    assert intents.parse("turn left 45").angle == pytest.approx(math.radians(45))
+    assert intents.parse("turn right ninety degrees").angle == pytest.approx(math.pi / 2)
+    assert intents.parse("turn left for half a second").duration == 0.5
+    assert intents.parse("turn around").angle == pytest.approx(math.pi)
+    assert intents.parse("go forward for 3 seconds").duration == 3
+    assert intents.parse("drive forward one and a half meters").distance == 1.5
+    assert intents.parse("drive forward a meter").distance == 1.0
+    assert intents.parse("slide right 5cm").distance == pytest.approx(-0.05)
+    assert [type(c).__name__ for c in intents.parse_all("turn left 30 degrees and drive forward 20 cm")] == ["Drive", "Drive"]
+
+
+def test_a_joint_number_is_never_read_as_a_target():
+    """ "joint 1 up for 2 seconds" was read as "set the joint named 'joint' to 1 radian"."""
+    for t in ("joint 1 up for 2 seconds", "joint1 up for two seconds", "move joint1", "move joint1 forward 10 cm",
+              "raise joint 2", "move joint1 to 20 degrees for 2 seconds", "move the elbow joint"):
+        assert intents.parse_all(t) == [], t
+    assert intents.parse("set joint 2 to -15 degrees") == SetJoints({"joint2": math.radians(-15)})
+    assert intents.parse("move joint 1 to 20 degrees") == SetJoints({"joint1": math.radians(20)})
+    assert intents.parse("move joint1 20 degrees") == SetJoints({"joint1": math.radians(20)})
+
+
+def test_a_sentence_eddy_cannot_use_comes_with_a_hint():
+    sim = SimAdapter()
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    r = eddy.tell("turn left 30cm")
+    assert not r.ok and '"turn left 30 degrees"' in r.message and (sim.x, sim.heading) == (0.0, 0.0)
+    r = eddy.tell("joint 1 up for 2 seconds")
+    assert not r.ok and '"move joint1 to 20 degrees"' in r.message and all(v == 0 for v in sim.joints.values())
+    r = eddy.tell("go back 80 degees for 20 cm")
+    assert not r.ok and "unit" in r.message and sim.x == 0.0
+    assert eddy.tell("make me a sandwich").message == "I don't know how to \"make me a sandwich\"."

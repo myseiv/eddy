@@ -48,17 +48,51 @@ def _num(token: str) -> float:
     return float(_WORDS[token]) if token in _WORDS else float(token)
 
 
-def _amount(text: str, units: dict) -> Optional[float]:
-    """Find "<number> <unit>" in the text and return it in base units (metres or seconds)."""
+_ANGLE = {"deg": 1.0, "degree": 1.0, "degrees": 1.0}
+# Number words, for spotting an amount Eddy has not used ("a", "an", "to" and "for" are left out:
+# they are ordinary words far more often than numbers).
+_NUMBER_WORDS = re.compile(r"\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|"
+                           r"forty-five|fifty|sixty|ninety|hundred|one-eighty|half|quarter)\b")
+
+
+def _take(text: str, units: dict):
+    """Find "<number> <unit>" in the text. Returns (the amount in base units, the text without it),
+    or (None, the text) if there is none."""
     # "half a meter" and "a quarter of a second" are a half and a quarter, not "a meter".
+    text = re.sub(r"\b(?:a\s+|one\s+)?(half|quarter)\s+(?:of\s+)?an?\s+", r"\1 ", text)
     names = "|".join(sorted(units, key=len, reverse=True))
     # "one and a half meters": the number plus a half.
     m = re.search(_NUM + r"\s+and\s+a\s+half\s*(" + names + r")\b", text)
     if m:
-        return (_num(m.group(1)) + 0.5) * units[m.group(2)]
-    text = re.sub(r"\b(?:a\s+|one\s+)?(half|quarter)\s+(?:of\s+)?an?\s+", r"\1 ", text)
-    m = re.search(_NUM + r"\s*(" + "|".join(sorted(units, key=len, reverse=True)) + r")\b", text)
-    return _num(m.group(1)) * units[m.group(2)] if m else None
+        return (_num(m.group(1)) + 0.5) * units[m.group(2)], text[:m.start()] + " " + text[m.end():]
+    m = re.search(_NUM + r"\s*(" + names + r")\b", text)
+    if m:
+        return _num(m.group(1)) * units[m.group(2)], text[:m.start()] + " " + text[m.end():]
+    return None, text
+
+
+def _amount(text: str, units: dict) -> Optional[float]:
+    """Find "<number> <unit>" in the text and return it in base units (metres or seconds)."""
+    return _take(text, units)[0]
+
+
+def _numbers_left(text: str) -> bool:
+    """True if a number is still in the text once the amounts a command used are taken out.
+    Such a number is an amount Eddy would otherwise drop ("turn left 30 cm" turning 90 degrees)."""
+    return bool(re.search(r"\d", text) or _NUMBER_WORDS.search(text))
+
+
+def hint(text: str) -> str:
+    """A short suggestion for a sentence Eddy could not use, or "" if it has none."""
+    t = text.lower()
+    if "joint" in t:
+        return ' To move one joint, say where it should go: "move joint1 to 20 degrees".'
+    if re.search(r"\b(turn|rotate|spin)\b", t) and _amount(t, _LENGTH) is not None:
+        return (' A turn is given in degrees: "turn left 30 degrees". To turn and drive, say each in order: '
+                '"turn left 30 degrees and drive forward 20 cm".')
+    if re.search(r"\d", t):
+        return " Give each amount a unit Eddy knows (cm, meters, degrees or seconds), one amount per step."
+    return ""
 
 
 def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
@@ -96,10 +130,22 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
 
     # One joint on its own: "set joint1 to 0.3", "move joint elbow to 20 degrees".
     # The value is radians unless the sentence says degrees.
-    m = re.search(r"\b(?:joint\s+(\w+)|(\w*joint\w*))\s+(?:to\s+)?(-?\d+(?:\.\d+)?)\s*(deg|degree|degrees)?\b", t)
+    # "joint 1" is joint1, never a joint called "joint" set to 1.
+    value = r"\s+(?:to\s+)?(-?\d+(?:\.\d+)?)\s*(deg|degree|degrees)?\b"
+    m = re.search(r"\bjoint\s*(\d+)" + value, t)
+    named = None
     if m:
-        value = float(m.group(3))
-        return SetJoints({m.group(1) or m.group(2): math.radians(value) if m.group(4) else value})
+        named, amount, unit = "joint" + m.group(1), m.group(2), m.group(3)
+    else:
+        m = re.search(r"\b(?:joint\s+(?!to\b)([a-z_]\w*)|(\w*joint\w+|\w+joint\w*))" + value, t)
+        if m:
+            named, amount, unit = m.group(1) or m.group(2), m.group(3), m.group(4)
+    if m:
+        if _numbers_left(t[:m.start()] + " " + t[m.end():]):
+            return None             # "move joint1 to 20 degrees for 2 seconds": not guessed
+        return SetJoints({named: math.radians(float(amount)) if unit else float(amount)})
+    if "joint" in t:
+        return None                 # about a joint, but not where it should go ("move joint1", "joint1 up")
 
     # The arm, relative to where it is: "move the arm up 5 cm", "raise the arm", "arm left 10 cm".
     # With no amount it moves 5 cm.
@@ -138,9 +184,9 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
         side = re.search(r"\b(left|right)\b", t)
         if not side or re.search(r"(?<![\w.])-\d", t):
             return None
-        distance = _amount(t, _LENGTH)
-        if distance is None and (re.search(r"\d", t) or _amount(t, _TIME) is not None):
-            return None             # "slide left 20": twenty what? Not guessed.
+        distance, rest = _take(t, _LENGTH)
+        if _numbers_left(rest) or _amount(rest, _TIME) is not None:
+            return None             # "slide left 20", "slide left 30 degrees": not guessed
         slow = 0.5 if re.search(r"\b(slow|slowly|careful|carefully)\b", t) else 1.0
         return Slide((1.0 if side.group(1) == "left" else -1.0) * (distance or 0.2), 0.15 * slow)
 
@@ -167,21 +213,27 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
     turn = re.search(r"\b(turn|rotate|spin|face|left|right|around)\b", t)
     straight = re.search(r"\b(forward|forwards|ahead|straight|back|backward|backwards|reverse)\b", t)
     if turn and not straight:
-        # "turn around" with no angle given means 180 degrees.
-        if re.search(r"\b(around|about)\b", t) and not re.search(_NUM + r"\s*(deg|degree|degrees)\b", t):
+        if re.search(r"(?<![\w.])-\d", t):
+            return None             # a negative amount is ambiguous: say the direction instead
+        if _amount(t, _LENGTH) is not None:
+            return None             # "turn left 30 cm": a turn is in degrees or seconds, a distance is not guessed into one
+        angle, rest = _take(t, _ANGLE)
+        duration, rest = _take(rest, _TIME)
+        if angle is not None and duration is not None:
+            return None             # both an angle and a time: not guessed
+        # A bare number after a turn ("turn left 45") is degrees.
+        bare = re.search(r"(?<![\w.])(\d+(?:\.\d+)?)\s*$", rest) if angle is None and duration is None else None
+        if bare:
+            angle, rest = float(bare.group(1)), rest[:bare.start()]
+        if _numbers_left(rest):
+            return None             # an amount Eddy would otherwise drop
+        # "turn around" with no amount means 180 degrees.
+        if angle is None and duration is None and re.search(r"\b(around|about)\b", t):
             return Drive(angular=w, angle=math.pi)
         # Positive angular speed is left (counter-clockwise); right and clockwise are negative.
         direction = -1.0 if re.search(r"\b(right|clockwise)\b", t) and not re.search(r"counter|anti", t) else 1.0
-        if re.search(r"(?<![\w.])-\d", t):
-            return None             # a negative amount is ambiguous: say the direction instead
-        deg = re.search(_NUM + r"\s*(deg|degree|degrees)\b", t)
-        duration = _amount(t, _TIME)
-        # A bare number after a turn ("turn left 45") is degrees.
-        bare = re.search(r"(?<![\w.])(\d+(?:\.\d+)?)\s*$", t) if not deg and duration is None else None
-        if bare:
-            return Drive(angular=direction * w, angle=math.radians(float(bare.group(1))))
-        if deg:
-            return Drive(angular=direction * w, angle=math.radians(_num(deg.group(1))))
+        if angle is not None:
+            return Drive(angular=direction * w, angle=math.radians(angle))
         if duration:
             return Drive(angular=direction * w, duration=duration)
         if re.search(r"\b(left|right|clockwise)\b", t):
@@ -192,12 +244,14 @@ def parse(text: str, speed: float = 0.2, turn_speed: float = 0.8):
 
     if straight or re.search(r"\b(go|drive|move|come|advance|roll|fly)\b", t):
         direction = -1.0 if re.search(r"\b(back|backward|backwards|reverse)\b", t) else 1.0
-        distance, duration = _amount(t, _LENGTH), _amount(t, _TIME)
         if re.search(r"(?<![\w.])-\d", t):
             return None             # a negative amount is ambiguous: say the direction instead
-        if distance is None and duration is None and (re.search(r"\d", t) or re.search(
-                r"\b(one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty|forty|fifty|sixty|ninety|hundred)\b", t)):
-            return None             # "go forward 5": five what? Not guessed.
+        distance, rest = _take(t, _LENGTH)
+        duration, rest = _take(rest, _TIME)
+        if distance is not None and duration is not None:
+            return None             # "drive forward 1 meter for 5 seconds": which one? Not guessed.
+        if _numbers_left(rest):
+            return None             # "go forward 5" (five what?), "go back 80 degrees for 20 cm": not guessed
         if turn and re.search(r"\b(turn|rotate|spin)\b", t):
             return None             # "turn left go forward": two commands run together; not guessed
         if distance is not None:

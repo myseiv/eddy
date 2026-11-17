@@ -112,7 +112,7 @@ class Eddy:
         robot's own operator."""
         commands = intents.parse_all(text)
         if not commands:
-            result = Result(False, f"I don't know how to \"{text.strip()}\".")
+            result = Result(False, f"I don't know how to \"{text.strip()}\"." + intents.hint(text))
             if self.log is not None:
                 self.log.write("command", source=source, said=text, command=None, ok=False, message=result.message)
             return self._finish(result)
