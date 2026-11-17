@@ -25,6 +25,9 @@ Taken from Hiwonder's MentorPi source (driver/controller), which the owner suppl
   - the driver for the mecanum base reads a sideways speed (linear.y), limited to 0.2 m/s
     (odom_publisher_node.py), and Hiwonder's own programs drive sideways that way. Sliding has
     not been observed on the real LanderPi; here the base slides exactly as commanded
+  - the car driver moves the steering servo only when the turn rate is not zero, so a command
+    with a turn rate of exactly 0 leaves the steering where the last turn put it (seen on the
+    real car on 2026-11-17: "straight" drives after a turn veered 7 to 42 degrees)
 Assumed (not observed): the linkage joints are marked <mimic> in the URDF, their names, the
 arm's link lengths, and that laser angle 0 is the robot's front.
 
@@ -181,7 +184,7 @@ class Controller(Node):
 def main():
     rclpy.init()
     sim = SimAdapter(name=KIND, arm=False, car=(0.145 if KIND == "car" else False),
-                     slides=(KIND == "landerpi")).go_live()
+                     slides=(KIND == "landerpi"), steering_holds=(KIND == "car")).go_live()
     names = ARM + ["r_joint"] if KIND == "landerpi" else []
     arm = {"now": {n: 0.0 for n in names}, "target": {n: 0.0 for n in names}}
     nodes = [App(), Base(sim, arm)]

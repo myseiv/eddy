@@ -91,6 +91,13 @@ else:
     r, moved, *_ = tell("slide right 20 cm")
     check("and is refused at once the second time", not r.ok and moved < 0.01, r.message)
 
+# Straight after a turn: on the real car the steering stayed turned and "straight" drives veered.
+tell("turn left 45 degrees")
+r, moved, turned, b = tell("drive forward 50 cm")
+check("drives straight after a turn (the steering is re-centred)", r.ok and abs(turned) < 4, f"veered {turned:+.1f} deg; {r.message}")
+r, moved, turned, b = tell("go back 50 cm")
+check("reverses straight after a turn", r.ok and abs(turned) < 4, f"veered {turned:+.1f} deg; {r.message}")
+
 r, moved, turned, b = tell("wander for 25 seconds")
 check("wanders and turns away from walls", r.ok and "0 times" not in r.message, r.message)
 r, *_ = tell("dance")

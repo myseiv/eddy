@@ -30,7 +30,7 @@ def default_dir() -> str:
 
 def snapshot(state) -> dict:
     """The parts of a RobotState worth keeping, as plain JSON values."""
-    keep = ("x", "y", "heading", "z", "range_ahead", "range_behind", "gripper", "has_odometry",
+    keep = ("x", "y", "heading", "z", "range_ahead", "range_behind", "axis_ahead", "axis_behind", "gripper", "has_odometry",
             "odom_age", "range_age", "joints")
     out = {}
     for name in keep:

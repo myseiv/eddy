@@ -43,6 +43,22 @@ class Adapter:
         """Set the gripper: 0 is closed, 1 is fully open."""
         raise Unsupported("this robot has no gripper")
 
+    def hold_joints(self, names) -> None:
+        """Stop these joints where they are now (used when an arm move is cut short)."""
+        now = self.state().joints
+        self.set_joints({n: now.get(n, 0.0) for n in names}, 0.2)
+
+    def gripper_feedback(self) -> Optional[Dict[str, float]]:
+        """What the robot reports about where its gripper is, as {name: value}, or None if it
+        reports nothing. Used to check that a gripper command really moved the gripper."""
+        g = self.state().gripper
+        return None if g is None else {"gripper": float(g)}
+
+    def gripper_at(self, opening: float) -> Optional[bool]:
+        """Whether the gripper is already at this opening (0 closed .. 1 open); None if it cannot be told."""
+        g = self.state().gripper
+        return None if g is None else abs(float(g) - opening) < 0.05
+
     # Why there is no camera picture, for adapters that have none (shown on the web page).
     camera_note = "Eddy cannot read a camera on this kind of robot."
 

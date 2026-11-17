@@ -1278,3 +1278,199 @@ def test_a_sentence_eddy_cannot_use_comes_with_a_hint():
     r = eddy.tell("go back 80 degees for 20 cm")
     assert not r.ok and "unit" in r.message and sim.x == 0.0
     assert eddy.tell("make me a sandwich").message == "I don't know how to \"make me a sandwich\"."
+
+
+# ---- a car whose steering stays where the last turn left it (the real car, 2026-11-17) ----
+
+class Recorder(SimAdapter):
+    """A simulator that remembers every speed command sent to it."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.sent = []
+
+    def set_velocity(self, linear, angular, vertical=0.0, lateral=0.0):
+        self.sent.append((float(linear), float(angular)))
+        return super().set_velocity(linear, angular, vertical, lateral)
+
+
+def test_a_car_whose_steering_holds_still_drives_straight_after_a_turn():
+    """On the real car, "straight" drives after a turn veered 7 to 42 degrees: its driver keeps the
+    steering where the last turn put it when told to turn at exactly 0."""
+    sim = Recorder(car=True, steering_holds=True, room=30.0)
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    assert eddy.tell("turn left 90 degrees").ok
+    for sentence in ("drive forward 1 meter", "go back 50 cm"):
+        before = sim.heading
+        sim.sent.clear()
+        r = eddy.tell(sentence)
+        veer = math.degrees(abs(math.atan2(math.sin(sim.heading - before), math.cos(sim.heading - before))))
+        assert r.ok and veer < 3, (sentence, veer, r.message)
+        assert all(w != 0 for v, w in sim.sent if v != 0)          # never "exactly straight" while moving
+
+
+def test_wheels_left_turned_before_eddy_started_are_straightened():
+    sim = SimAdapter(car=True, steering_holds=True, room=30.0)
+    sim.curve = 3.0                                                     # someone left the wheels turned
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    assert eddy.tell("drive forward 1 meter").ok and abs(math.degrees(sim.heading)) < 3 and abs(sim.y) < 0.05
+
+
+def test_wander_on_a_car_whose_steering_holds_does_not_drive_in_circles():
+    sim = SimAdapter(car=True, steering_holds=True, room=30.0)
+    sim.curve = 3.0
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    eddy.tell("wander for 10 seconds")                                  # an open room: nothing to turn away from
+    assert math.hypot(sim.x, sim.y) > 1.5 and abs(math.degrees(sim.heading)) < 5
+
+
+def test_a_car_is_never_asked_to_steer_tighter_than_the_cap():
+    """The real car's driver clamps a steering angle past 45 degrees to +45 whatever its sign, so
+    a too-tight right turn becomes a left turn. Eddy keeps its requests well inside that."""
+    from eddy.brain import CURVE
+    sim = Recorder(car=True, room=30.0)
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    for sentence in ("turn right 90 degrees", "turn right fast 90 degrees", "turn left quickly 45 degrees"):
+        sim.sent.clear()
+        assert eddy.tell(sentence).ok
+        assert all(abs(w) <= CURVE * abs(v) + 1e-9 for v, w in sim.sent if v != 0), sentence
+
+
+# ---- slipping, confirmed by the wide laser view as well -----------------------------
+
+class LaserSim(SimAdapter):
+    """Adds the narrow straight-ahead laser beam. broken_beam: it always reads the same.
+    spinning: the odometry runs on but the robot (and so everything the laser sees) stays put."""
+
+    def __init__(self, broken_beam=False, spinning=False):
+        super().__init__(room=30.0)
+        self.broken_beam, self.spinning = broken_beam, spinning
+        self.true_x = 0.0
+
+    def state(self):
+        s = super().state()
+        x = self.true_x if self.spinning else s.x
+        s.range_ahead = self.room - x - self.radius
+        s.axis_ahead = 3.0 if self.broken_beam else s.range_ahead
+        s.range_max = 60.0
+        return s
+
+
+def test_a_robot_that_moves_is_not_called_slipping_because_one_beam_is_stuck():
+    r = Eddy(LaserSim(broken_beam=True), Speaker("silent")).tell("drive forward 1 meter")
+    assert r.ok and "slipping" not in r.message, r.message
+
+
+def test_wheels_that_spin_in_place_are_still_caught():
+    r = Eddy(LaserSim(spinning=True), Speaker("silent")).tell("drive forward 1 meter")
+    assert not r.ok and "slipping" in r.message, r.message
+
+
+def test_an_interrupted_reach_is_not_reported_as_reached():
+    """Found by tests/manip: a stop in the middle of an arm move was reported as "Reached x ..."
+    while the arm stood 36 cm short of the point."""
+    import threading, time
+    sim = SimAdapter(realtime=True)
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    out = []
+    worker = threading.Thread(target=lambda: out.append(eddy.tell("reach 0.25 0.1 0.2")))
+    worker.start()
+    time.sleep(0.3)
+    eddy.tell("stop")
+    worker.join(timeout=10)
+    assert out and out[0].message.startswith("Interrupted") and "short of" in out[0].message, out[0].message
+    assert "Reached" not in out[0].message
+
+
+# ---- the gripper is only reported as moved if it did (the real LanderPi, 2026-11-17) ----
+
+class StuckGripperSim(SimAdapter):
+    """A gripper that ignores every command, as the real LanderPi's did."""
+
+    def set_gripper(self, opening):
+        pass
+
+
+class BlindGripperSim(SimAdapter):
+    """A gripper that moves but reports nothing about where it is."""
+
+    def state(self):
+        s = super().state()
+        s.gripper = None
+        return s
+
+
+def test_a_gripper_that_does_not_move_is_not_reported_as_closed():
+    eddy = Eddy(StuckGripperSim(), Speaker("silent"))
+    eddy.start()
+    r = eddy.tell("close the gripper")
+    assert not r.ok and "did not move" in r.message and "Gripper closed" not in r.message, r.message
+
+
+def test_a_gripper_already_where_it_was_asked_to_go_says_so():
+    eddy = Eddy(StuckGripperSim(), Speaker("silent"))          # starts open, and stays open
+    eddy.start()
+    r = eddy.tell("open the gripper")
+    assert r.ok and "already open" in r.message, r.message
+    sim = SimAdapter()
+    eddy = Eddy(sim, Speaker("silent"))
+    eddy.start()
+    assert eddy.tell("close the gripper").message == "Gripper closed."
+    r = eddy.tell("close gripper")
+    assert r.ok and "already closed" in r.message, r.message
+
+
+def test_a_gripper_that_reports_nothing_is_not_claimed_to_have_moved():
+    eddy = Eddy(BlindGripperSim(), Speaker("silent"))
+    eddy.start()
+    r = eddy.tell("close the gripper")
+    assert r.ok and "cannot confirm" in r.message, r.message
+
+
+def test_ros_gripper_reading_comes_from_the_joints_not_from_the_command():
+    """The ROS adapter used to report the gripper as wherever it was last told to go."""
+    from eddy.adapters.ros2 import Ros2Adapter
+    a = Ros2Adapter()
+    a._controllers = {"/g": {"gripper": True, "joints": ["r_joint"]}}
+    a._mimics = {"l1": "r_joint", "l2": "r_joint"}
+    a._limits = {"r_joint": (-1.57, 0.0, "revolute")}
+    assert a.gripper_feedback() is None                     # nothing about the gripper reported yet
+    a._state.joints.update({"l1": 0.0, "l2": 0.0, "wheel": 3.0})
+    assert a.gripper_feedback() == {"l1": 0.0, "l2": 0.0}    # followers of the gripper joint, not wheels
+    assert a.gripper_at(0.0) is None                         # the driving joint itself is not reported
+    a._state.joints["r_joint"] = -1.57
+    assert a.gripper_at(0.0) is True and a.gripper_at(1.0) is False
+
+
+# ---- an arm that is stopped holds where it is (not where it was a moment ago) ----
+
+def test_a_stopped_arm_is_held_where_it_will_be_not_where_it_was():
+    """After a stop the arm settled back 2 to 4 degrees on the mocks: it was told to hold at a
+    joint reading one update old. The hold is now placed where the arm will be when it arrives."""
+    from eddy.adapters.ros2 import hold_target
+    # Moving at 1.5 rad/s, last reading 0.02 s ago, readings every 0.05 s.
+    assert hold_target(1.0, 1.5, 0.02, 0.05, (-2.0, 2.0)) == pytest.approx(1.0 + 1.5 * 0.07)
+    assert hold_target(1.0, 0.01, 0.02, 0.05, (-2.0, 2.0)) == 1.0          # not moving: hold where it is
+    assert hold_target(1.95, 1.5, 0.02, 0.05, (-2.0, 2.0)) == 2.0          # never past a limit
+    assert hold_target(1.0, 1.5, 5.0, 0.05, (-2.0, 2.0)) == 1.0            # a stale reading is not extrapolated
+
+
+def test_slide_without_a_direction_does_nothing_and_says_which_way_to_give():
+    """Checked on request (2026-11-17): "slide 20cm" must not turn or move any kind of robot."""
+    for sim in (SimAdapter(), SimAdapter(car=True, steering_holds=True), SimAdapter(slides=True)):
+        eddy = Eddy(sim, Speaker("silent"))
+        eddy.start()
+        for sentence in ("slide 20cm", "strafe 20 cm", "sidestep"):
+            r = eddy.tell(sentence)
+            assert not r.ok and '"slide left 20 cm"' in r.message, r.message
+            assert (sim.x, sim.y, sim.heading, sim.v, sim.w) == (0.0, 0.0, 0.0, 0.0, 0.0)
+    # And a slide on a robot that cannot slide is found out without turning it.
+    for sim in (SimAdapter(), SimAdapter(car=True, steering_holds=True)):
+        eddy = Eddy(sim, Speaker("silent"))
+        eddy.start()
+        assert not eddy.tell("slide left 20 cm").ok and sim.heading == 0.0 and (sim.x, sim.y) == (0.0, 0.0)

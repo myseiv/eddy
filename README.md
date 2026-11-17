@@ -140,7 +140,13 @@ is not a certified safety system: keep a physical emergency stop on any robot th
 ./tests/sims/run.sh
 ```
 
-All but the first need Docker. `tests/ros2/run.sh` runs Eddy against a mock robot on real
+```bash
+./tests/manip/run.sh
+```
+
+All but the first need Docker; run them one at a time (containers see each other's ROS topics).
+`tests/manip/run.sh` runs 13 checks for robots that drive and have an arm on three of them,
+including Gazebo's stock vehicle carrying a stock Franka Panda. `tests/ros2/run.sh` runs Eddy against a mock robot on real
 ROS 2 Jazzy, and `tests/peers/run.sh` runs two robots on separate machines talking to each
 other. `run_hiwonder.sh` uses stand-ins for two real robots Eddy has been tried on.
 `tests/sims/run.sh` uses public simulators that were not written for Eddy (a Franka Panda arm

@@ -140,9 +140,9 @@ class Base(Node):
 class TrajectoryController(Node):
     """Stands in for a ros2_control joint_trajectory_controller."""
 
-    def __init__(self, name: str, joints, apply):
+    def __init__(self, name: str, joints, apply, hold=None):
         super().__init__(name)
-        self.joints, self.apply = joints, apply
+        self.joints, self.apply, self.hold = joints, apply, hold
         # Real controllers expose their joints as a parameter; Eddy reads it to learn them.
         self.declare_parameter("joints", joints)
         if os.environ.get("EDDY_MOCK_ACTIONS"):
@@ -162,6 +162,9 @@ class TrajectoryController(Node):
 
     def on_trajectory(self, msg: JointTrajectory):
         """Apply the last point of a trajectory, if it names exactly this controller's joints."""
+        if not msg.points and self.hold is not None and sorted(msg.joint_names) == sorted(self.joints):
+            self.hold()         # as ros2_control's controller does: an empty trajectory means stop where you are
+            return
         if sorted(msg.joint_names) != sorted(self.joints) or not msg.points:
             self.get_logger().error(f"rejected trajectory for joints {list(msg.joint_names)}")   # as the real one does
             return
@@ -174,7 +177,8 @@ def main():
     sim = SimAdapter(name="mockbot").go_live()
     nodes = [
         Base(sim),
-        TrajectoryController("arm_controller", ARM, sim.set_joints),
+        TrajectoryController("arm_controller", ARM, sim.set_joints,
+                             hold=lambda: sim.set_joints({n: sim.joints[n] for n in ARM})),
         TrajectoryController("gripper_controller", ["finger"], lambda p: sim.set_gripper(p["finger"] / FINGER_TRAVEL)),
     ]
     executor = SingleThreadedExecutor()

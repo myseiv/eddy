@@ -23,8 +23,13 @@ class SimAdapter(Adapter):
 
     def __init__(self, name: str = "sim-rover", room: float = 2.0, realtime: bool = False,
                  arm: bool = True, drive: bool = True, car: bool = False,
-                 flies: bool = False, slides: bool = False):
+                 flies: bool = False, slides: bool = False, steering_holds: bool = False):
         self.name = name
+        # steering_holds (car only): like a real car driver seen in the lab, the steering is only
+        # moved by a command with a turn in it, so a command to go straight (turn rate exactly 0)
+        # leaves the wheels where the last turn put them. A turn asked for standing still centres them.
+        self.steering_holds = steering_holds
+        self.curve = 0.0            # the steering, as curvature (1/m), when it holds its position
         self.slides = slides        # True: a base that can move sideways (mecanum wheels)
         self.vy = 0.0               # commanded sideways speed, positive to the left
         self.flies = flies          # True: a flying robot, which obeys climb commands
@@ -90,6 +95,8 @@ class SimAdapter(Adapter):
             return super().set_velocity(linear, angular)
         self.v, self.w = float(linear), float(angular)
         self.vy = float(lateral) if self.slides else 0.0
+        if self.steering_holds and angular != 0:
+            self.curve = 0.0 if linear == 0 else float(angular) / float(linear)
         self.vz = float(vertical) if self.flies else 0.0
 
     def set_joints(self, positions: Dict[str, float], duration: float = 1.0) -> None:
@@ -157,7 +164,8 @@ class SimAdapter(Adapter):
             # A car can only turn as fast as its speed allows (car=True: 0.25 m tightest turning
             # circle; car=<number>: that radius in metres).
             tightest = 0.25 if self.car is True else float(self.car or 0)     # turning circle radius, m
-            w = max(-abs(self.v) / tightest, min(abs(self.v) / tightest, self.w)) if self.car else self.w
+            w = self.v * self.curve if (self.car and self.steering_holds) else self.w
+            w = max(-abs(self.v) / tightest, min(abs(self.v) / tightest, w)) if self.car else w
             self.heading = math.atan2(math.sin(self.heading + w * dt), math.cos(self.heading + w * dt))
             nx = self.x + (self.v * math.cos(self.heading) - self.vy * math.sin(self.heading)) * dt
             ny = self.y + (self.v * math.sin(self.heading) + self.vy * math.cos(self.heading)) * dt

@@ -303,6 +303,18 @@ def cloud_front_range(x, y, z, half_width: float = 0.4, below: float = 0.2, abov
     return float(d[keep].min()) if keep.any() else None
 
 
+def hold_target(position: float, velocity: float, age: float, period: float, limits) -> float:
+    """Where to hold a joint that is told to stop while it moves: where it will be when the command
+    arrives (its last reading carried on at its last speed for the reading's age plus one update),
+    not where it was. Holding at the old reading makes the arm swing back to it.
+    A joint that is barely moving, or a reading too old to trust, is held where it was read."""
+    if abs(velocity) < 0.05 or age > 0.5:
+        return position
+    lead = min(0.3, max(0.0, age) + max(0.0, period))
+    lower, upper = limits
+    return max(lower, min(upper, position + velocity * lead))
+
+
 class Ros2Adapter(Adapter):
     """Controls a ROS 2 robot through the topics its own nodes already provide."""
     kind = "ros2"
@@ -338,6 +350,7 @@ class Ros2Adapter(Adapter):
         self._limits: Dict[str, Tuple[float, float, str]] = {}
         self._mimics: Dict[str, str] = {}       # joints that only follow another joint
         self._we_started_rclpy = False
+        self._jtrack: Dict[str, dict] = {}        # joint -> last position, when it came, speed, time between readings
         self._jpeg: Optional[bytes] = None        # the camera's latest picture
         self._camera_sub = None                   # the camera subscription, made the first time a picture is asked for
         self._camera_try = 0                      # which of the robot's camera feeds is being tried
@@ -698,10 +711,20 @@ class Ros2Adapter(Adapter):
             self._seen.add("scan")
 
     def _on_joints(self, msg) -> None:
-        """Joint states: keep each joint's position."""
+        """Joint states: keep each joint's position, and how fast it is changing."""
+        now = time.monotonic()
         with self._lock:
             for name, pos in zip(msg.name, msg.position):
                 self._state.joints[name] = pos
+                old = self._jtrack.get(name)
+                if old is None:
+                    self._jtrack[name] = {"pos": pos, "t": now, "vel": 0.0, "period": 0.05, "count": 1}
+                    continue
+                dt = now - old["t"]
+                if dt < 1e-3:
+                    continue
+                old.update(vel=(pos - old["pos"]) / dt, period=min(0.5, 0.7 * old["period"] + 0.3 * dt),
+                           pos=pos, t=now, count=old["count"] + 1)
 
     def _on_description(self, msg) -> None:
         """The robot's URDF."""
@@ -852,6 +875,10 @@ class Ros2Adapter(Adapter):
             if sent.done() and not sent.result().accepted:
                 raise RuntimeError("the joint controller rejected the move (joints: "
                                    + ", ".join(controller["joints"]) + ")")
+            if sent.done():
+                # Keep the goal, so a stop can cancel it while it is still running.
+                controller["goal"] = sent.result()
+                controller["result"] = controller["goal"].get_result_async()
         else:
             controller["pub"].publish(msg)
 
@@ -889,8 +916,76 @@ class Ros2Adapter(Adapter):
                 lower, upper, _ = self._limits.get(j, (0.0, 1.0, "revolute"))
                 target[j] = lower + min(1.0, max(0.0, opening)) * (upper - lower)
             self._send_trajectory(c, target, 1.0)
+
+    def _gripper_joints(self):
+        """The gripper controllers' joints and the joints that follow them, and the controllers' own."""
+        own = [j for c in self._controllers.values() if c["gripper"] for j in c["joints"]]
+        followers = [f for f, d in self._mimics.items() if d in own]
+        return own, followers
+
+    def gripper_feedback(self) -> Optional[Dict[str, float]]:
+        """The reported positions of the gripper's joints (its own, or ones that follow it)."""
+        own, followers = self._gripper_joints()
         with self._lock:
-            self._state.gripper = opening
+            seen = {j: float(self._state.joints[j]) for j in own + followers if j in self._state.joints}
+        return seen or None
+
+    def gripper_at(self, opening: float) -> Optional[bool]:
+        """Whether the gripper's own joints already read the targets this opening would send them."""
+        own, _ = self._gripper_joints()
+        with self._lock:
+            seen = {j: self._state.joints[j] for j in own if j in self._state.joints}
+        if not seen:
+            return None
+        def target(j):
+            lower, upper, _ = self._limits.get(j, (0.0, 1.0, "revolute"))
+            return lower + min(1.0, max(0.0, opening)) * (upper - lower)
+        return all(abs(v - target(j)) < 0.02 * max(1e-3, abs(self._limits.get(j, (0.0, 1.0, ""))[1]
+                                                                - self._limits.get(j, (0.0, 1.0, ""))[0])) + 1e-3
+                   for j, v in seen.items())
+
+    def hold_joints(self, names) -> None:
+        """Stop these joints. First the controller's own stop, where it has one (a ros2_control
+        trajectory controller holds where it is on an empty trajectory, or when its goal is
+        cancelled); then a hold placed where each joint will be, not where it was last read."""
+        from trajectory_msgs.msg import JointTrajectory
+        names = set(names)
+        native = False
+        for c in self._controllers.values():
+            if c["gripper"] or not names & set(c["joints"]):
+                continue
+            if "client" in c:
+                if c.get("goal") is not None and not c["result"].done():
+                    c["goal"].cancel_goal_async()
+                    native = True
+                c["goal"] = None
+            elif "pub" in c:
+                msg = JointTrajectory()
+                msg.joint_names = list(c["joints"])
+                c["pub"].publish(msg)
+                native = True
+        if native:
+            # Give the controller's stop a moment, then judge the arm's speed from readings taken
+            # after it, so an arm the controller already stopped is not pushed on.
+            with self._lock:
+                counts = {n: self._jtrack[n]["count"] for n in names if n in self._jtrack}
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if all(self._jtrack[n]["count"] >= k + 2 for n, k in counts.items()):
+                        break
+                time.sleep(0.01)
+        now = time.monotonic()
+        targets = {}
+        with self._lock:
+            for n in names:
+                t = self._jtrack.get(n)
+                lower, upper, _ = self._limits.get(n, (-math.pi, math.pi, "revolute"))
+                if t is None:
+                    targets[n] = float(self._state.joints.get(n, 0.0))
+                else:
+                    targets[n] = hold_target(t["pos"], t["vel"], now - t["t"], t["period"], (lower, upper))
+        self.set_joints(targets, 0.2)
 
     def stop(self) -> None:
         """Send zero velocity three times, in case one message is lost."""

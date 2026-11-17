@@ -51,12 +51,27 @@ BLIND = 1.0         # seconds without a range reading after which the last one i
 STALL = 2.0         # seconds a drive may show no progress at all before Eddy gives up on it
 SHORT = math.radians(12)    # a laser can be this far out on a good turn, so less than this is not a jam
 AGREE = 0.85        # the share of the odometry's turn the laser must confirm
+# Driving straight means holding the heading the drive started with. The correction is never
+# exactly zero while moving: a real car's driver (Hiwonder MentorPi) leaves its steering wherever
+# the last turn put it when told to turn at exactly 0, so "straight" drives veered 7 to 42 degrees.
+HOLD = 0.3          # rad/s: the largest correction
+HOLD_GAIN = 1.5     # rad/s of correction per radian off course
+HOLD_MIN = 1e-3     # rad/s: the smallest turn rate sent while moving (far too small to see)
+# The tightest a car-like robot is asked to steer: turn rate over speed (1/m, a 0.17 m turning
+# circle). The same car's driver clamps any steering angle past 45 degrees to +45 whatever its
+# sign, which turns a too-tight right turn into a left one.
+CURVE = 6.0
 SIDE = 1.0          # metres: the most Eddy slides sideways in one command, since it cannot see to the side
 
 
 def _wrap(a: float) -> float:
     """Bring an angle into -pi..pi, so heading differences across the +/-180 line stay small."""
     return math.atan2(math.sin(a), math.cos(a))
+
+
+def _cap(angular: float, linear: float) -> float:
+    """The turn rate for a car-like robot rolling at `linear`, no tighter than CURVE allows."""
+    return math.copysign(min(abs(angular), CURVE * abs(linear)), angular)
 
 
 class Eddy:
@@ -297,15 +312,45 @@ class Eddy:
                 raise Unsupported("this robot has no joints to send home")
             return self._joints({n: 0.0 for n in names}, mine, label="Home")
         if isinstance(command, Gripper):
-            self.adapter.set_gripper(command.opening)
-            # Grippers rarely report their position, so give the move the second it is
-            # allowed before saying it is done (a newer command cuts the wait short).
-            waited = 0.0
-            while waited < 1.0 and self._epoch == mine:
-                self.adapter.wait(self.safety.tick)
-                waited += self.safety.tick
-            return "Gripper open." if command.opening >= 0.5 else "Gripper closed."
+            return self._grip(command, mine)
         raise Unsupported(f"unknown command {type(command).__name__}")
+
+    def _grip(self, command: Gripper, mine: int) -> str:
+        """Open or close the gripper, and say only what the robot shows really happened."""
+        word = "open" if command.opening >= 0.5 else "closed"
+        before = self.adapter.gripper_feedback()
+        self.adapter.set_gripper(command.opening)
+        # Watch the gripper's reported position until it has moved and settled (at most 2 s;
+        # a newer command cuts the wait short). Without a reading, give it the second it is allowed.
+        waited, moved, still, last = 0.0, False, 0.0, before
+        while waited < (2.0 if before is not None else 1.0) and self._epoch == mine:
+            self.adapter.wait(self.safety.tick)
+            waited += self.safety.tick
+            if before is None:
+                continue
+            now = self.adapter.gripper_feedback() or {}
+            changed = any(abs(now.get(k, v) - v) > 0.002 for k, v in before.items())
+            stepping = any(abs(now.get(k, v) - v) > 0.0005 for k, v in (last or {}).items())
+            moved = moved or changed
+            still = still + self.safety.tick if not stepping else 0.0
+            last = now
+            if moved and still >= 0.2:
+                break
+        if before is None:
+            return (f"Gripper command sent ({word}). This robot does not report where its gripper is, "
+                    "so I cannot confirm it moved.")
+        if self._epoch != mine and not moved:
+            return "Interrupted before the gripper moved."
+        if moved:
+            self._grip_state = word
+            return f"Gripper {word}."
+        already = self.adapter.gripper_at(command.opening)
+        if already or (already is None and getattr(self, "_grip_state", None) == word):
+            self._grip_state = word
+            return f"The gripper is already {word}."
+        raise Refused(f"I sent the {'open' if word == 'open' else 'close'} command, but the gripper did not move: "
+                      "its joints read the same before and after. It may already have been "
+                      f"{word}, or the gripper is not responding. Check it before relying on it.")
 
     def _limits(self, linear: float, angular: float):
         """Apply the speed scale, then clamp to the robot's own maximum speeds."""
@@ -326,6 +371,18 @@ class Eddy:
         if linear == 0:
             return False        # turning on the spot
         return s.range_ahead is not None and s.range_ahead < self.safety.min_range
+
+    def _hold(self, heading0: Optional[float], s=None) -> float:
+        """The turn rate that keeps a straight move on `heading0` (None: no heading to hold).
+        Never exactly zero (see HOLD_MIN)."""
+        if heading0 is not None:
+            s = s if s is not None else self.adapter.state()
+            if s.has_odometry:
+                turn = max(-HOLD, min(HOLD, HOLD_GAIN * _wrap(heading0 - s.heading)))
+                if abs(turn) >= HOLD_MIN:
+                    return turn
+                return math.copysign(HOLD_MIN, turn) if turn else HOLD_MIN
+        return HOLD_MIN
 
     def _drive(self, cmd: Drive, mine: int, trim: bool = True) -> str:
         """Drive a distance, turn an angle, or drive for a time."""
@@ -361,6 +418,7 @@ class Eddy:
         arc = spot_turn and self.model.drive.kind == CAR
         if arc:
             lin = self._limits(CREEP, 0.0)[0]
+            ang = _cap(ang, lin)
         if self._blocked(lin):
             raise Refused(NO_ROOM if arc else
                           "something is too close " + ("behind me" if lin < 0 else "in front of me"))
@@ -388,6 +446,15 @@ class Eddy:
             nothing = r is None or (state.range_max is not None and r >= 0.98 * state.range_max)
             return None if nothing else r
         mark_range = seen(start) if straight else None
+
+        def wide(state):
+            """The laser's wide view in the direction of travel (the nearest thing in it)."""
+            if state.range_age is not None and state.range_age > BLIND:
+                return None
+            r = state.range_ahead if lin > 0 else state.range_behind
+            nothing = r is None or (state.range_max is not None and r >= 0.98 * state.range_max)
+            return None if nothing else r
+        mark_wide = wide(start) if straight else None
         sent = 0.0                              # the speed last commanded along the goal (m/s or rad/s)
         rate, rate_from = 0.0, None             # the speed the odometry actually shows, and (progress, time) it was last seen at
         mark_scan = start.scan_turn             # the laser's own count of the turn, at the window start
@@ -434,6 +501,7 @@ class Eddy:
                                     why = "no room"
                                     break
                                 arc, lin = True, self._limits(CREEP, 0.0)[0]
+                                ang = _cap(ang, lin)
                                 mark_time = elapsed
                                 deadline = elapsed + min(goal / 0.03 + 6, 2 * self.safety.max_drive_seconds)
                                 continue
@@ -449,12 +517,17 @@ class Eddy:
                                 break
                         mark_scan = s.scan_turn
                         if straight:
-                            now_range = seen(s)
-                            if (mark_range is not None and now_range is not None and progress - mark_progress >= 0.15
-                                    and mark_range - now_range < 0.3 * (progress - mark_progress)):
+                            now_range, now_wide = seen(s), wide(s)
+                            covered = progress - mark_progress
+                            # Slipping only if neither the narrow beam nor the wide view came closer:
+                            # on the real car one narrow beam stayed put while the robot really moved.
+                            closed_in = (mark_wide is not None and now_wide is not None
+                                         and mark_wide - now_wide >= 0.3 * covered)
+                            if (mark_range is not None and now_range is not None and covered >= 0.15
+                                    and mark_range - now_range < 0.3 * covered and not closed_in):
                                 why = "slipping"
                                 break
-                            mark_range = now_range
+                            mark_range, mark_wide = now_range, now_wide
                         mark_time, mark_progress = elapsed, progress
                     if arc and self.model.drive.kind != CAR and turned >= math.radians(5):
                         self.model.drive.kind = CAR     # it worked: remember for the next turn
@@ -462,7 +535,12 @@ class Eddy:
                     scale = max(0.2, min(1.0, left / ease))
                 # Slowing down near the goal: a robot turning while it rolls keeps its rolling speed
                 # and eases only the steering, or it would crawl and never finish.
-                self.adapter.set_velocity(lin if arc else lin * scale, ang * scale)
+                turn = ang * scale
+                if straight:
+                    # Hold the heading where the position is being read anyway; a timed drive only
+                    # times the move (an extra reading per tick would slow it on a slow link).
+                    turn = self._hold(start.heading, s) if odometry else HOLD_MIN
+                self.adapter.set_velocity(lin if arc else lin * scale, turn)
                 sent = abs(lin if cmd.distance is not None else ang) * scale
                 step = min(tick, deadline - elapsed)
                 self.adapter.wait(step)
@@ -745,6 +823,7 @@ class Eddy:
         backing = True                                      # a car-like robot starts its turn by backing away
         away = math.pi * 0.6                                # turn about 110 degrees away
         last_heading = self.adapter.state().heading
+        ahead_from = None                                   # the heading the current straight stretch holds
         try:
             while elapsed < duration:
                 if self._epoch != mine:
@@ -776,12 +855,17 @@ class Eddy:
                     else:
                         # A car-like robot backs away while steering; others turn on the spot.
                         creep = self._limits(CREEP, 0.0)[0]
-                        self.adapter.set_velocity((-creep if backing else creep) if car else 0.0, ang)
+                        self.adapter.set_velocity((-creep if backing else creep) if car else 0.0,
+                                                  _cap(ang, creep) if car else ang)
                         turn_time += tick
                 elif s.range_ahead is not None and s.range_ahead < caution:
                     turning, turn_done, turn_time, backing = True, 0.0, 0.0, True   # something is close: turn away
+                    ahead_from = None
                 else:
-                    self.adapter.set_velocity(lin, 0.0)                 # path is clear: go forward
+                    if ahead_from is None:
+                        ahead_from = s.heading
+                    # Path is clear: go forward, holding the heading this stretch began on.
+                    self.adapter.set_velocity(lin, self._hold(ahead_from if s.has_odometry else None, s))
                 last_heading = s.heading
                 self.adapter.wait(tick)
                 elapsed += self._tock()
@@ -804,7 +888,13 @@ class Eddy:
         result = chain.ik(target, q0=q0)
         if not result.success:
             raise Refused(f"I can't reach that point (closest I can get is {result.error * 100:.1f} cm away)")
-        self._joints(result.as_dict(chain), mine)
+        done = self._joints(result.as_dict(chain), mine)
+        if done.startswith("Interrupted"):
+            # A stop or a newer command cut the move short: say where the arm really is, not "reached".
+            now = self.adapter.state().joints
+            gap = math.dist(target, chain.position([now.get(n, 0.0) for n in chain.joint_names]))
+            return (f"Interrupted: the arm stopped {gap * 100:.0f} cm short of x {cmd.x:.2f}, y {cmd.y:.2f}, "
+                    f"z {cmd.z:.2f} and is holding there.")
         return f"Reached x {cmd.x:.2f}, y {cmd.y:.2f}, z {cmd.z:.2f}."
 
     def _joints(self, positions: dict, mine: int, label: str = "Joints", strict: bool = False) -> str:
@@ -837,10 +927,19 @@ class Eddy:
         elapsed, limit = 0.0, duration * 2 + 1.0
         while elapsed < (limit if feedback else duration):
             if self._epoch != mine:
-                # A newer command arrived: command the joints to stay where they are now.
-                current = self.adapter.state().joints
-                self.adapter.set_joints({n: current.get(n, targets[n]) for n in targets}, 0.2)   # hold still
-                return f"{label} move interrupted."
+                # A newer command arrived: stop the joints where they are, and wait for the arm to
+                # come to rest, so what is reported is where it really stopped.
+                self.adapter.hold_joints(list(targets))
+                if feedback:
+                    last, still, waited = self.adapter.state().joints, 0.0, 0.0
+                    while waited < 0.6 and still < 0.1:
+                        self.adapter.wait(self.safety.tick)
+                        waited += self.safety.tick
+                        now_j = self.adapter.state().joints
+                        moving = any(abs(now_j.get(n, 0.0) - last.get(n, 0.0)) > 0.002 for n in targets)
+                        still = 0.0 if moving else still + self.safety.tick
+                        last = now_j
+                return f"Interrupted ({label.lower()} move stopped part way; the arm is holding where it is)."
             if feedback:
                 current = self.adapter.state().joints
                 if all(abs(current.get(n, 1e9) - targets[n]) < 0.02 for n in targets):

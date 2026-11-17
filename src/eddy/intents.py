@@ -85,6 +85,8 @@ def _numbers_left(text: str) -> bool:
 def hint(text: str) -> str:
     """A short suggestion for a sentence Eddy could not use, or "" if it has none."""
     t = text.lower()
+    if re.search(r"\b(slide|strafe|sidestep|sideways|crab)\b", t) and not re.search(r"\b(left|right)\b", t):
+        return ' Say which way: "slide left 20 cm" or "slide right 20 cm".'
     if "joint" in t:
         return ' To move one joint, say where it should go: "move joint1 to 20 degrees".'
     if re.search(r"\b(turn|rotate|spin)\b", t) and _amount(t, _LENGTH) is not None:
