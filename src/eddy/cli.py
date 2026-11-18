@@ -295,7 +295,7 @@ def cmd_doctor(args) -> int:
         """Print one line of the report."""
         print(f"  [{'ok' if ok else '--'}] {label:<26} {note}")
 
-    print(f"Eddy AI {__version__}\n")
+    print(f"Eddy {__version__}\n")
     machine = platform.machine()
     board = ""
     # On a Raspberry Pi (and other ARM boards) this file holds the board's name.
@@ -363,7 +363,7 @@ def cmd_selftest(args) -> int:
 
 def main(argv=None) -> int:
     """Parse the command line and run the chosen sub-command. Returns the exit code."""
-    parser = argparse.ArgumentParser(prog="eddy", description="Eddy AI: one controller for any robot.")
+    parser = argparse.ArgumentParser(prog="eddy", description="Eddy: one controller for any robot.")
     parser.add_argument("--version", action="version", version=f"eddy {__version__}")
     sub = parser.add_subparsers(dest="command")
 

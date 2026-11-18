@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Eddy AI on this machine (Raspberry Pi OS, Ubuntu, Debian, macOS).
+# Install Eddy on this machine (Raspberry Pi OS, Ubuntu, Debian, macOS).
 #
 #   ./scripts/install.sh                 core only: simulator, ROS 2, network robots, CLI
 #   ./scripts/install.sh --serial        + microcontroller robots over USB serial
@@ -121,7 +121,7 @@ if [ -n "$SERVICE_ARGS" ]; then
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/eddy.service" <<EOF
 [Unit]
-Description=Eddy AI robot controller
+Description=Eddy robot controller
 After=network-online.target
 
 [Service]

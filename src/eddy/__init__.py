@@ -1,4 +1,4 @@
-"""Eddy AI: a plug-and-play controller that wraps any robot's existing code."""
+"""Eddy: a plug-and-play controller that wraps any robot's existing code."""
 __version__ = "0.1.0"
 
 # The names most programs need, importable straight from `eddy`:
