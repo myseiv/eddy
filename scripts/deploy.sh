@@ -20,8 +20,12 @@ SSH=(ssh ${EDDY_SSH_OPTS:-})
 
 echo "==> Copying Eddy to $HOST:~/$REMOTE_DIR"
 # tar over ssh: works even where rsync is not installed on the robot.
-tar -C "$HERE" --exclude .venv --exclude .git --exclude __pycache__ --exclude '*.egg-info' \
-    --exclude .pytest_cache --exclude models -czf - . \
+# Files listed in .git/info/exclude (kept on this machine only) are not copied either.
+LOCAL=()
+[ -f "$HERE/.git/info/exclude" ] && LOCAL=(--exclude-from "$HERE/.git/info/exclude")
+tar -C "$HERE" ${LOCAL[@]+"${LOCAL[@]}"} --exclude .venv --exclude .git --exclude __pycache__ --exclude '*.egg-info' \
+    --exclude .pytest_cache --exclude models --exclude docs --exclude reports \
+    --exclude research_notes -czf - . \
   | "${SSH[@]}" "$HOST" "mkdir -p '$REMOTE_DIR' && tar -xzf - -C '$REMOTE_DIR'"
 
 # Quote each remaining argument so it survives the trip through ssh intact.

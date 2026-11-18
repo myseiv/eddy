@@ -1,7 +1,7 @@
 """Stand-ins for the two real robots Eddy was tried on, for testing away from the lab.
 
 This is NOT Hiwonder's software. It reproduces, on a real ROS 2 graph, the things observed
-on the two robots (see docs/LOG.md), with Eddy's simulator as the physics:
+on the two real robots, with Eddy's simulator as the physics:
 
   EDDY_MOCK_KIND=landerpi   mecanum base with a 5-joint arm and a gripper
   EDDY_MOCK_KIND=car        car-steered base, no arm ("rosmentor")

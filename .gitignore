@@ -11,3 +11,8 @@ voice_results.json
 wake_results.json
 sign_results.json
 stop_results.json
+
+# Kept on this machine only, not published
+docs/
+reports/
+research_notes/

@@ -154,4 +154,13 @@ on stock ros2_control controllers, Gazebo's stock differential-drive and car-ste
 vehicles, and its stock quadcopter) and compares every result with the simulator's true pose; it builds a 4 GB image
 the first time and takes about ten minutes.
 
-See [docs/PLAN.md](docs/PLAN.md) for the design, what has been verified, and what comes next.
+Step-by-step setup guides for ROS 2, network (TCP) and microcontroller robots are in [setup/](setup/README.md).
+
+## Citing Eddy
+
+If you use Eddy in your work, please cite it. GitHub's "Cite this repository" button gives the
+reference from [CITATION.cff](CITATION.cff); a paper describing Eddy is in preparation.
+
+## Licence
+
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE).

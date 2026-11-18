@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use Eddy AI, please cite it using the metadata below."
+title: "Eddy AI: a plug-and-play controller that wraps any robot's existing code"
+type: software
+# TODO before release: replace with real names (family-names / given-names), add the
+# supervisor and any other contributors, and add ORCID iDs if you have them.
+authors:
+  - alias: myseiv
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-11-18"
+repository-code: "https://github.com/myseiv/eddy_ai"
+keywords:
+  - robotics
+  - ROS 2
+  - robot control
+  - multi-robot systems
+  - plug and play
+abstract: >-
+  Eddy attaches to a robot's existing software without modifying it, works out what the
+  robot can do (from a live ROS 2 graph and URDF, or a self-describing serial/TCP line
+  protocol), and accepts one set of commands on every robot: typed, spoken offline, hand
+  signs, programmatic, or from another robot. It runs without a language model, checks every
+  command against the robot's limits and sensors, and lets robots coordinate peer to peer
+  with signed messages.
+# When the paper is out, add it here as preferred-citation so GitHub's "Cite this
+# repository" button points to the paper.
