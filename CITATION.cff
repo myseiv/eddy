@@ -2,10 +2,10 @@ cff-version: 1.2.0
 message: "If you use Eddy, please cite it using the metadata below."
 title: "Eddy: a plug-and-play controller that wraps any robot's existing code"
 type: software
-# TODO before release: replace with real names (family-names / given-names), add the
-# supervisor and any other contributors, and add ORCID iDs if you have them.
 authors:
-  - alias: myseiv
+  - given-names: Oluwatobi
+    family-names: Talabi
+    alias: myseiv
 license: Apache-2.0
 version: 0.1.0
 date-released: "2026-11-18"
