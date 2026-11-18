@@ -24,11 +24,11 @@ python3 --version
 Get the code:
 
 ```bash
-git clone https://github.com/myseiv/eddy_ai.git
+git clone https://github.com/myseiv/eddy.git
 ```
 
 ```bash
-cd eddy_ai
+cd eddy
 ```
 
 Install the core (simulator, ROS 2, network robots):

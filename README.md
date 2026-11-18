@@ -1,4 +1,4 @@
-# Eddy AI
+# Eddy
 
 A plug-and-play controller that sits on top of a robot's existing code and controls it.
 
@@ -49,7 +49,7 @@ From this folder on your computer (the Pi only needs SSH enabled):
 Or, on the Pi itself, once the code is on GitHub:
 
 ```bash
-git clone <your-repo-url> eddy_ai && cd eddy_ai && ./scripts/install.sh --all
+git clone https://github.com/myseiv/eddy.git && cd eddy && ./scripts/install.sh --all
 ```
 
 `--all` adds serial robots, voice and vision; leave it off for the core only. The installer
