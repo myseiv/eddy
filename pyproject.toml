@@ -32,3 +32,5 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# tests/voice is a hands-on script for a real microphone (run it by hand), not a unit test
+addopts = "--ignore=tests/voice"
